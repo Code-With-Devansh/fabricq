@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+#
+# Dev-only image. NOT for production - this skips the non-root user,
+# multi-stage slimming, and --omit=dev from the production Dockerfile,
+# none of which matter for a local dev loop and would only get in the way
+# of fast rebuilds.
+FROM node:22-alpine
+WORKDIR /usr/src/app
+
+# Copying only the lockfiles first means this layer is cached and skipped
+# on every rebuild where dependencies haven't changed - only your actual
+# source edits (mounted in via the bind mount below, not copied here)
+# trigger nodemon, not a docker rebuild.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Source is NOT copied here - it's bind-mounted at runtime by
+# docker-compose.dev.yml so edits on disk are visible immediately without
+# rebuilding the image.
+
+EXPOSE 3000
+
