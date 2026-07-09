@@ -1,5 +1,28 @@
 import { z } from "zod";
 
+const authConfigSchema = z.discriminatedUnion("auth_type", [
+  z.object({ auth_type: z.literal("NONE") }),
+  z.object({
+    auth_type: z.literal("BEARER"),
+    auth_config: z.object({ token: z.string().min(1) }),
+  }),
+  z.object({
+    auth_type: z.literal("BASIC"),
+    auth_config: z.object({
+      username: z.string().min(1),
+      password: z.string().min(1),
+    }),
+  }),
+  z.object({
+    auth_type: z.literal("API_KEY"),
+    auth_config: z.object({
+      key: z.string().min(1),
+      value: z.string().min(1),
+      in: z.enum(["header", "query"]).optional().default("header"),
+    }),
+  }),
+]);
+
 export const createJobSchema = z
   .object({
     method: z.enum([
@@ -14,7 +37,19 @@ export const createJobSchema = z
 
     body: z.record(z.string(), z.any()).optional().default({}),
 
+    body_type: z.enum(["json", "form"]).optional().default("json"),
+
     headers: z.record(z.string(), z.string()).optional().default({}),
+
+    query_params: z.record(z.string(), z.string()).optional().default({}),
+
+    auth_type: z.enum(["NONE", "BEARER", "BASIC", "API_KEY"]).optional().default("NONE"),
+
+    auth_config: z.record(z.string(), z.any()).optional().default({}),
+
+    redirect_mode: z.enum(["follow", "manual", "error"]).optional().default("follow"),
+
+    timeout_ms: z.number().int().min(1).max(120_000).optional().default(30_000),
 
     schedule_type: z.enum(["ONCE", "CRON"]),
 
@@ -27,6 +62,19 @@ export const createJobSchema = z
     backoff_seconds: z.number().int().min(0).optional().default(60),
   })
   .superRefine((data, ctx) => {
+    const authResult = authConfigSchema.safeParse({
+      auth_type: data.auth_type,
+      auth_config: data.auth_config,
+    });
+    if (!authResult.success) {
+      for (const issue of authResult.error.issues) {
+        ctx.addIssue({
+          ...issue,
+          path: ["auth_config", ...issue.path.filter((p) => p !== "auth_type")],
+        });
+      }
+    }
+
     if (data.schedule_type === "ONCE") {
       if (data.run_at == null) {
         ctx.addIssue({
@@ -70,7 +118,13 @@ export const updateJobSchema = z
     method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional(),
     url: z.string().url().optional(),
     body: z.record(z.string(), z.any()).optional(),
+    body_type: z.enum(["json", "form"]).optional(),
     headers: z.record(z.string(), z.string()).optional(),
+    query_params: z.record(z.string(), z.string()).optional(),
+    auth_type: z.enum(["NONE", "BEARER", "BASIC", "API_KEY"]).optional(),
+    auth_config: z.record(z.string(), z.any()).optional(),
+    redirect_mode: z.enum(["follow", "manual", "error"]).optional(),
+    timeout_ms: z.number().int().min(1).max(120_000).optional(),
     schedule_type: z.enum(["ONCE", "CRON"]).optional(),
     run_at: z.number().int().positive().optional(),
     cron_expression: z.string().optional(),
@@ -82,6 +136,21 @@ export const updateJobSchema = z
     message: "At least one field must be provided to update.",
   })
   .superRefine((data, ctx) => {
+    if (data.auth_type != null && data.auth_type !== "NONE") {
+      const authResult = authConfigSchema.safeParse({
+        auth_type: data.auth_type,
+        auth_config: data.auth_config ?? {},
+      });
+      if (!authResult.success) {
+        for (const issue of authResult.error.issues) {
+          ctx.addIssue({
+            ...issue,
+            path: ["auth_config", ...issue.path.filter((p) => p !== "auth_type")],
+          });
+        }
+      }
+    }
+
     if (data.schedule_type === "ONCE" && data.cron_expression != null) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

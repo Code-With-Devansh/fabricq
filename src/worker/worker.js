@@ -13,33 +13,100 @@ import {
   getJobById,
 } from "../repositories/httpJob.repository.js";
 
-const HTTP_TIMEOUT_MS = 30_000;
+const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+
+// Builds the final URL, folding in query_params and (for API_KEY auth
+// configured to live "in query") the auth key/value pair.
+function buildUrl(execution) {
+  const url = new URL(execution.url);
+
+  for (const [key, value] of Object.entries(execution.query_params ?? {})) {
+    url.searchParams.set(key, value);
+  }
+
+  if (execution.auth_type === "API_KEY") {
+    const { key, value, in: location = "header" } = execution.auth_config ?? {};
+    if (location === "query" && key) {
+      url.searchParams.set(key, value);
+    }
+  }
+
+  return url.toString();
+}
+
+// Returns the Authorization/other headers a job's auth_type implies.
+// API_KEY-in-query is handled in buildUrl instead, not here.
+function buildAuthHeaders(execution) {
+  const { auth_type, auth_config = {} } = execution;
+
+  switch (auth_type) {
+    case "BEARER":
+      return { Authorization: `Bearer ${auth_config.token}` };
+    case "BASIC": {
+      const encoded = Buffer.from(
+        `${auth_config.username}:${auth_config.password}`,
+      ).toString("base64");
+      return { Authorization: `Basic ${encoded}` };
+    }
+    case "API_KEY":
+      if ((auth_config.in ?? "header") === "header" && auth_config.key) {
+        return { [auth_config.key]: auth_config.value };
+      }
+      return {};
+    case "NONE":
+    default:
+      return {};
+  }
+}
+
+// Converts a plain object body into a request body + Content-Type,
+// according to the job's body_type ("json" or "form").
+function buildRequestBody(execution) {
+  const body = execution.body ?? {};
+  if (execution.body_type === "form") {
+    const form = new URLSearchParams();
+    for (const [key, value] of Object.entries(body)) {
+      form.append(key, value == null ? "" : String(value));
+    }
+    return {
+      contentTypeHeader: { "Content-Type": "application/x-www-form-urlencoded" },
+      payload: form.toString(),
+    };
+  }
+
+  // default: json
+  return {
+    contentTypeHeader: { "Content-Type": "application/json" },
+    payload: JSON.stringify(body),
+  };
+}
 
 async function executeHttpJob(execution) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
-
+  const timeoutMs = execution.timeout_ms ?? DEFAULT_HTTP_TIMEOUT_MS;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const hasBody = !["GET", "DELETE"].includes(execution.method);
-  
-  
-  
-  
-  
-    const res = await fetch(execution.url, {
+    const { contentTypeHeader, payload } = hasBody
+      ? buildRequestBody(execution)
+      : { contentTypeHeader: {}, payload: undefined };
+
+    const res = await fetch(buildUrl(execution), {
       method: execution.method,
       headers: {
-        ...(hasBody && { "Content-Type": "application/json" }),
+        ...contentTypeHeader,
+        ...buildAuthHeaders(execution),
         ...(execution.headers ?? {}),
       },
-      body: hasBody ? JSON.stringify(execution.body ?? {}) : undefined,
+      body: payload,
+      redirect: execution.redirect_mode ?? "follow",
       signal: controller.signal,
     });
 
     const responseBody = await res.text();
-  
-  
+
+
     return {
       success: res.ok,
       responseStatus: res.status,
@@ -47,14 +114,21 @@ async function executeHttpJob(execution) {
       error: res.ok ? null : `HTTP ${res.status}`,
     };
   } catch (err) {
-  
-  
+    // fetch() throws a TypeError with "unsafe redirect" language when
+    // redirect_mode is "error" and a redirect is encountered - surface
+    // that distinctly rather than lumping it into a generic message.
+    const isRedirectError =
+      execution.redirect_mode === "error" &&
+      err instanceof TypeError &&
+      /redirect/i.test(err.message);
+
     return {
       success: false,
       responseStatus: null,
       responseBody: null,
-      error:
-        err instanceof Error
+      error: isRedirectError
+        ? "Redirect encountered with redirect_mode=error"
+        : err instanceof Error
           ? err.name === "AbortError"
             ? "Request timed out"
             : err.message

@@ -14,7 +14,13 @@ export async function createJob(job) {
       max_attempts,
       attempts,
       backoff_seconds,
-      next_run
+      next_run,
+      query_params,
+      body_type,
+      auth_type,
+      auth_config,
+      redirect_mode,
+      timeout_ms
     )
     VALUES (
       $1,
@@ -28,7 +34,13 @@ export async function createJob(job) {
       $9, 
       $10, 
       $11,
-      to_timestamp($12::bigint)
+      to_timestamp($12::bigint),
+      $13,
+      $14,
+      $15,
+      $16,
+      $17,
+      $18
  )
     RETURNING *;
   `;
@@ -46,6 +58,12 @@ export async function createJob(job) {
     job.attempts,
     job.backoff_seconds,
     job.next_run,
+    job.query_params ?? {},
+    job.body_type ?? "json",
+    job.auth_type ?? "NONE",
+    job.auth_config ?? {},
+    job.redirect_mode ?? "follow",
+    job.timeout_ms ?? 30000,
   ];
 
   const { rows } = await pool.query(query, values);
@@ -189,6 +207,12 @@ export async function updateJob(jobId, fields) {
     "next_run",
     "run_at",
     "cron_expression",
+    "query_params",
+    "body_type",
+    "auth_type",
+    "auth_config",
+    "redirect_mode",
+    "timeout_ms",
   ];
 
   const sets = [];
