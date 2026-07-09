@@ -49,6 +49,41 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
       REDIS_URL: redis://redis:6379
 
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fabricq-scheduler
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://redis:6379
+    command: node src/scheduler-process.js
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://redis:6379
+    command: node src/worker-process.js
+    # No container_name - scale with: docker compose up -d --scale worker=3
+    # (deploy.replicas is a Swarm-only field and is ignored by plain `docker compose up`)
+
 volumes:
   postgres_data:
   redis_data:

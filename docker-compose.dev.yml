@@ -55,7 +55,63 @@ services:
       REDIS_URL: redis://redis:6379
     command: sh -c "npm install && npx nodemon --legacy-watch src/server.js"
 
+  scheduler:
+    build:
+      context: .
+      dockerfile: dockerfile.dev
+    container_name: fabricq-scheduler
+
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/usr/src/app
+      - node_modules:/usr/src/app/node_modules
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://redis:6379
+    command: sh -c "npm install && npx nodemon --legacy-watch src/scheduler_process.js"
+
+  worker:
+    build:
+      context: .
+      dockerfile: dockerfile.dev
+    container_name: fabricq-worker
+
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/usr/src/app
+      - node_modules:/usr/src/app/node_modules
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://redis:6379
+    command: sh -c "npm install && npx nodemon --legacy-watch src/worker_process.js"
+    # To run more than one worker in dev, drop container_name and use:
+    # docker compose -f docker-compose.dev.yml up -d --scale worker=2
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    networks:
+    - internal
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
 volumes:
+  pgadmin_data:
   postgres_data:
   redis_data:
   node_modules:

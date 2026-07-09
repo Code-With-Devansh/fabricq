@@ -2,7 +2,7 @@ import { CronExpressionParser } from "cron-parser";
 import { pool } from "../config/db.js";
 import redis from "../config/redis.js";
 import logger from "../config/logger/index.js";
-import { claimDueJobs, markJobScheduled } from "../repositories/job.repository.js";
+import { claimDueJobs, markJobScheduled } from "../repositories/httpJob.repository.js";
 import { createExecution } from "../repositories/execution.repository.js";
 
 const EXECUTION_QUEUE_KEY = "fabricq:executions";

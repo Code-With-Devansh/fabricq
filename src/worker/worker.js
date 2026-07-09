@@ -7,7 +7,11 @@ import {
   markExecutionRunning,
   completeExecution,
 } from "../repositories/execution.repository.js";
-import { incrementAttempts, finalizeJobRun, getJobById } from "../repositories/job.repository.js";
+import {
+  incrementAttempts,
+  finalizeJobRun,
+  getJobById,
+} from "../repositories/httpJob.repository.js";
 
 const HTTP_TIMEOUT_MS = 30_000;
 
@@ -15,19 +19,27 @@ async function executeHttpJob(execution) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
 
+
   try {
     const hasBody = !["GET", "DELETE"].includes(execution.method);
+  
+  
+  
+  
+  
     const res = await fetch(execution.url, {
       method: execution.method,
       headers: {
-        "Content-Type": "application/json",
+        ...(hasBody && { "Content-Type": "application/json" }),
         ...(execution.headers ?? {}),
       },
-      body: hasBody ? JSON.stringify(execution.payload ?? {}) : undefined,
+      body: hasBody ? JSON.stringify(execution.body ?? {}) : undefined,
       signal: controller.signal,
     });
 
     const responseBody = await res.text();
+  
+  
     return {
       success: res.ok,
       responseStatus: res.status,
@@ -35,11 +47,18 @@ async function executeHttpJob(execution) {
       error: res.ok ? null : `HTTP ${res.status}`,
     };
   } catch (err) {
+  
+  
     return {
       success: false,
       responseStatus: null,
       responseBody: null,
-      error: err.name === "AbortError" ? "Request timed out" : err.message,
+      error:
+        err instanceof Error
+          ? err.name === "AbortError"
+            ? "Request timed out"
+            : err.message
+          : String(err),
     };
   } finally {
     clearTimeout(timeout);
@@ -54,45 +73,65 @@ async function handleExecution(executionId) {
   }
 
   await markExecutionRunning(executionId);
+
   const result = await executeHttpJob(execution);
+
   await completeExecution(executionId, result);
 
   const client = await pool.connect();
   try {
+  
     await client.query("BEGIN");
+  
     await incrementAttempts(client, execution.job_id);
+  
 
     const job = await getJobById(client, execution.job_id);
+  
+  
     const isRecurring = execution.schedule_type === "CRON";
     const exhaustedRetries = job.attempts >= job.max_attempts;
+  
+  
 
     if (result.success) {
-      await finalizeJobRun(client, execution.job_id, { success: true, isRecurring });
+      await finalizeJobRun(client, execution.job_id, {
+        success: true,
+        isRecurring,
+      });
     } else if (!isRecurring && !exhaustedRetries) {
       // ONCE job that failed but has retries left: reschedule after backoff.
+    
       await client.query(
         `UPDATE http_jobs
          SET status = 'PENDING',
              next_run = now() + (backoff_seconds || ' seconds')::interval,
              updated_at = now()
          WHERE job_id = $1`,
-        [execution.job_id]
+        [execution.job_id],
       );
     } else {
-      await finalizeJobRun(client, execution.job_id, { success: false, isRecurring });
+    
+      await finalizeJobRun(client, execution.job_id, {
+        success: false,
+        isRecurring,
+      });
     }
 
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");
-    logger.error({ err, executionId }, "[worker] failed to update job after execution");
+    logger.error(
+      { err, executionId },
+      "[worker] failed to update job after execution",
+    );
   } finally {
     client.release();
   }
 
   logger.info(
     { executionId, jobId: execution.job_id, success: result.success },
-    "[worker] execution finished"
+    "[worker] execution finished",
   );
 }
 
