@@ -62,7 +62,7 @@ async function scheduleOne(client, job) {
     await markJobScheduled(client, job.job_id, { nextRun, isRecurring });
 
     await client.query("COMMIT");
-    await redis.lpush(EXECUTION_QUEUE_KEY, execution.execution_id);
+    await redis.lpush(EXECUTION_QUEUE_KEY, JSON.stringify({...job, execution_id: execution.execution_id}));
 
     logger.info(
       { jobId: job.job_id, executionId: execution.execution_id },

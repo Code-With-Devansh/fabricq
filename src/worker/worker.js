@@ -1,6 +1,7 @@
 import redis from "../config/redis.js";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
+import os from "os";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import {
   getExecutionWithJob,
@@ -14,12 +15,10 @@ import {
 } from "../repositories/httpJob.repository.js";
 
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+const HEARTBEAT_SET_KEY = "execution:heartbeats";
 
-// Builds the final URL, folding in query_params and (for API_KEY auth
-// configured to live "in query") the auth key/value pair.
 function buildUrl(execution) {
   const url = new URL(execution.url);
-
   for (const [key, value] of Object.entries(execution.query_params ?? {})) {
     url.searchParams.set(key, value);
   }
@@ -34,8 +33,6 @@ function buildUrl(execution) {
   return url.toString();
 }
 
-// Returns the Authorization/other headers a job's auth_type implies.
-// API_KEY-in-query is handled in buildUrl instead, not here.
 function buildAuthHeaders(execution) {
   const { auth_type, auth_config = {} } = execution;
 
@@ -59,8 +56,6 @@ function buildAuthHeaders(execution) {
   }
 }
 
-// Converts a plain object body into a request body + Content-Type,
-// according to the job's body_type ("json" or "form").
 function buildRequestBody(execution) {
   const body = execution.body ?? {};
   if (execution.body_type === "form") {
@@ -69,7 +64,9 @@ function buildRequestBody(execution) {
       form.append(key, value == null ? "" : String(value));
     }
     return {
-      contentTypeHeader: { "Content-Type": "application/x-www-form-urlencoded" },
+      contentTypeHeader: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
       payload: form.toString(),
     };
   }
@@ -106,7 +103,6 @@ async function executeHttpJob(execution) {
 
     const responseBody = await res.text();
 
-
     return {
       success: res.ok,
       responseStatus: res.status,
@@ -139,54 +135,40 @@ async function executeHttpJob(execution) {
   }
 }
 
-async function handleExecution(executionId) {
-  const execution = await getExecutionWithJob(executionId);
-  if (!execution) {
-    logger.warn({ executionId }, "[worker] execution not found, skipping");
-    return;
-  }
+async function handleExecution(job) {
+  await markExecutionRunning(job.execution_id);
 
-  await markExecutionRunning(executionId);
-
-  const result = await executeHttpJob(execution);
-
-  await completeExecution(executionId, result);
+  const result = await executeHttpJob(job);
 
   const client = await pool.connect();
   try {
-  
     await client.query("BEGIN");
-  
-    await incrementAttempts(client, execution.job_id);
-  
+    await completeExecution(client, job.execution_id, result);
 
-    const job = await getJobById(client, execution.job_id);
-  
-  
-    const isRecurring = execution.schedule_type === "CRON";
+    // await incrementAttempts(client, job.job_id);
+
+    const isRecurring = job.schedule_type === "CRON";
     const exhaustedRetries = job.attempts >= job.max_attempts;
-  
-  
 
     if (result.success) {
-      await finalizeJobRun(client, execution.job_id, {
+      await finalizeJobRun(client, job.job_id, {
         success: true,
         isRecurring,
       });
     } else if (!isRecurring && !exhaustedRetries) {
       // ONCE job that failed but has retries left: reschedule after backoff.
-    
+
       await client.query(
         `UPDATE http_jobs
          SET status = 'PENDING',
+             attempts = attempts + 1,
              next_run = now() + (backoff_seconds || ' seconds')::interval,
              updated_at = now()
          WHERE job_id = $1`,
-        [execution.job_id],
+        [job.job_id],
       );
     } else {
-    
-      await finalizeJobRun(client, execution.job_id, {
+      await finalizeJobRun(client, job.job_id, {
         success: false,
         isRecurring,
       });
@@ -196,7 +178,7 @@ async function handleExecution(executionId) {
   } catch (err) {
     await client.query("ROLLBACK");
     logger.error(
-      { err, executionId },
+      { err, executionId: job.execution_id },
       "[worker] failed to update job after execution",
     );
   } finally {
@@ -204,24 +186,48 @@ async function handleExecution(executionId) {
   }
 
   logger.info(
-    { executionId, jobId: execution.job_id, success: result.success },
+    {
+      executionId: job.execution_id,
+      jobId: job.job_id,
+      success: result.success,
+    },
     "[worker] execution finished",
   );
 }
 
+async function sendHeartBeat(executionId) {
+  try {
+    await redis.zadd(HEARTBEAT_SET_KEY, Date.now(), executionId);
+  } catch (err) {
+    logger.warn({ err, executionId }, "Failed to update heartbeat");
+  }
+}
+async function clearHeartBeats(executionId) {
+  await redis.zrem(HEARTBEAT_SET_KEY, executionId);
+}
+
 export async function startWorker() {
   logger.info("[worker] started, waiting for executions");
+  const WORKER_ID = `${os.hostname()}:${process.pid}`;
   // Simple blocking-pop loop. BRPOP blocks the connection until an item
   // arrives or timeout elapses - cheap on Redis, no busy-polling.
   for (;;) {
+    const result = await redis.brpop(EXECUTION_QUEUE_KEY, 5); // 5s timeout, then loop again
+    if (!result) continue; // timed out, nothing to do
+    const [, data] = result;
+    const job = JSON.parse(data);
+    await sendHeartBeat(job.execution_id);
+    const heartbeat = setInterval(() => {
+      void sendHeartBeat(job.execution_id);
+    }, 10_000);
     try {
-      const result = await redis.brpop(EXECUTION_QUEUE_KEY, 5); // 5s timeout, then loop again
-      if (!result) continue; // timed out, nothing to do
-      const [, executionId] = result;
-      await handleExecution(executionId);
+      await handleExecution(job);
     } catch (err) {
       logger.error({ err }, "[worker] loop error, retrying in 1s");
       await new Promise((r) => setTimeout(r, 1000));
+    } finally {
+      clearInterval(heartbeat);
+      await clearHeartBeats(job.execution_id);
     }
   }
 }

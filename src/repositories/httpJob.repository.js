@@ -121,12 +121,12 @@ export async function finalizeJobRun(client, jobId, { success, isRecurring }) {
   if (isRecurring) {
     // recurring jobs go back to PENDING regardless of outcome - they'll fire again
     await client.query(
-      `UPDATE http_jobs SET status = 'PENDING', updated_at = now() WHERE job_id = $1`,
+      `UPDATE http_jobs SET attempts = attempts + 1, status = 'PENDING', updated_at = now() WHERE job_id = $1`,
       [jobId]
     );
   } else {
     await client.query(
-      `UPDATE http_jobs SET status = $2, updated_at = now() WHERE job_id = $1`,
+      `UPDATE http_jobs SET attempts = attempts + 1, status = $2, updated_at = now() WHERE job_id = $1`,
       [jobId, success ? "COMPLETED" : "FAILED"]
     );
   }

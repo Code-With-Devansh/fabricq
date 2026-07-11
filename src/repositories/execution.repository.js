@@ -22,10 +22,11 @@ export async function markExecutionRunning(executionId) {
 }
 
 export async function completeExecution(
+  client,
   executionId,
   { success, responseStatus = null, responseBody = null, error = null }
 ) {
-  const { rows } = await pool.query(
+  const { rows } = await client.query(
     `UPDATE job_executions
      SET status = $2,
          finished_at = now(),
