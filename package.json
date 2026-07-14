@@ -8,8 +8,8 @@
     "dev": "docker compose -f docker-compose.dev.yml up --build",
     "migrate": "node src/db/migrate.js",
     "start": "docker compose up --build",
-    "scheduler": "node src/scheduler-process.js",
-    "worker": "node src/worker-process.js"
+    "scheduler": "node src/scheduler_process.js",
+    "worker": "node src/worker_process.js"
   },
   "keywords": [],
   "author": "",

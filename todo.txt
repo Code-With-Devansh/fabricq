@@ -1,0 +1,37 @@
+1. Redis connection config doesn't match docker-compose env. config/index.js reads REDIS_HOST/REDIS_PORT, but docker-compose.yml only sets REDIS_URL. In containers, config.redis.host will be undefined and Redis will never connect. Either standardize on REDIS_URL (new IORedis(process.env.REDIS_URL)) or set REDIS_HOST/REDIS_PORT in compose — pick one and make it consistent everywhere.
+2. make watchdog and reapers
+
+3. "Distributed locking so only one worker executes a job" — this mostly works via BRPOP (Redis pop is atomic, only one worker gets each item), but the Redis list itself isn't durable:
+
+	- If a worker pops a job with BRPOP and then crashes before markExecutionRunning, that job is gone — removed from Redis, but the DB row is still sitting at queued with nothing watching it.
+	- Recommend switching to the reliable-queue pattern (BLMOVE into a per-worker "processing" list) or, simpler here, add the same reaper above to also catch executions stuck in queued past a threshold.
+
+4. Graceful shutdown exists for the API (server.js), but not for worker.js or the scheduler. docker-compose down/rolling deploys send SIGTERM — the worker's for(;;) loop has no listener, so docker stop will hard-kill it (after the compose default 10s grace period), potentially mid-HTTP-call, leaving a heartbeat but no completed execution. Add SIGTERM handling: stop pulling new jobs, let the in-flight one finish (or hit the timeout), then exit — the reaper covers the rest.
+
+5. Retries/backoff works but is a flat per-job backoff_seconds, not exponential. Fine if that's intentional, but if you want the "configurable backoff" to mean exponential/jittered, that logic needs to live in the retry UPDATE in worker.js (currently just now() + backoff_seconds).
+
+6. incrementAttempts is defined, imported into worker.js, but never called (commented out) 
+
+7. getExecutionWithJob and getJobById are imported into worker.js but unused 
+
+8. Production Postgres pool (config/db.js) has no max, idleTimeoutMillis, or ssl config — most managed Postgres (RDS, Supabase, Neon) requires ssl: { rejectUnauthorized: false } or it won't connect at all.
+
+9. productionLogger.js has no redact config (the dev logger does). Since auth_config can contain bearer tokens/passwords and gets logged in job objects, add the same redaction (auth_config.token, auth_config.password, auth_config.value) to the prod logger.
+
+10. The API lets a caller POST any URL for the worker fleet to fetch server-side, with no allowlist/blocklist. That's a textbook SSRF vector — someone could point a job at http://169.254.169.254/latest/meta-data/ (cloud metadata endpoint) or your internal network/localhost and use your workers as a proxy. Add validation: block private/link-local IP ranges and localhost, and consider resolving DNS and re-checking the resolved IP (to stop DNS-rebinding).
+
+11. auth_config (bearer tokens, basic-auth passwords, API keys) is stored as plaintext JSONB. If this DB is ever read by an analyst, backup, or breached, all downstream credentials leak. Consider app-level encryption (e.g., encrypt auth_config with a KMS-managed key before insert).
+
+12. No auth/authz on the /jobs API at all — anyone who can reach it can create, read, update, or delete jobs. At minimum put an API key or JWT middleware in front of it before this is internet-facing.
+
+13. cors() is wide open (*) — restrict to known origins if this is called from a browser-facing app.
+
+14. docker-compose.yml: only Redis has a healthcheck; Postgres doesn't, and depends_on doesn't use condition: service_healthy for any service, so api/scheduler/worker can start racing an unready Postgres. Add a Postgres healthcheck (pg_isready) and condition: service_healthy.
+
+15. No migration step wired into deploy — you have to remember to run npm run migrate yourself. Add it as a one-shot init container/job, or run it as an entrypoint step before worker/scheduler/api start.
+
+16. No tests (package.json's test script is a stub) and no CI. Given the amount of transactional/concurrency-sensitive logic (SKIP LOCKED, retry/backoff transitions), this is exactly the kind of code that benefits from integration tests against a real Postgres+Redis (docker-compose test stack), especially regression tests around the claim → execute → finalize state machine.
+
+17. No metrics/observability: queue depth, in-flight executions, failure rate, and job lag (scheduled vs actually started) are all things you'll want dashboards/alerts on before calling this production-grade — even basic Prometheus counters exported from the worker/scheduler would go a long way.
+
+18. Single scheduler container is fine correctness-wise (SKIP LOCKED means you could even run several), but there's no documented scale-out for it in compose the way there is for worker — worth deciding if you want scheduler redundancy or accept it as a single point of latency (not correctness, since a restart just resumes polling).

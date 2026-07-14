@@ -1,6 +1,6 @@
 import { ZodError } from "zod";
 import logger from "../config/logger/index.js";
-import { AppError } from "../Error/AppError.js";
+import { AppError } from "../Error/appError.js";
 
 // Maps known Postgres error codes to (statusCode, message)
 function mapPgError(err) {

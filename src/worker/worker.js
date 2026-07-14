@@ -218,7 +218,7 @@ export async function startWorker() {
     const job = JSON.parse(data);
     await sendHeartBeat(job.execution_id);
     const heartbeat = setInterval(() => {
-      void sendHeartBeat(job.execution_id);
+      sendHeartBeat(job.execution_id);
     }, 10_000);
     try {
       await handleExecution(job);
