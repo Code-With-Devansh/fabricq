@@ -1,10 +1,6 @@
-1. Redis connection config doesn't match docker-compose env. config/index.js reads REDIS_HOST/REDIS_PORT, but docker-compose.yml only sets REDIS_URL. In containers, config.redis.host will be undefined and Redis will never connect. Either standardize on REDIS_URL (new IORedis(process.env.REDIS_URL)) or set REDIS_HOST/REDIS_PORT in compose — pick one and make it consistent everywhere.
 2. make watchdog and reapers
 
-3. "Distributed locking so only one worker executes a job" — this mostly works via BRPOP (Redis pop is atomic, only one worker gets each item), but the Redis list itself isn't durable:
-
-	- If a worker pops a job with BRPOP and then crashes before markExecutionRunning, that job is gone — removed from Redis, but the DB row is still sitting at queued with nothing watching it.
-	- Recommend switching to the reliable-queue pattern (BLMOVE into a per-worker "processing" list) or, simpler here, add the same reaper above to also catch executions stuck in queued past a threshold.
+3.anything else instead of random uuid. (i hate those dashes and id is too long).
 
 4. Graceful shutdown exists for the API (server.js), but not for worker.js or the scheduler. docker-compose down/rolling deploys send SIGTERM — the worker's for(;;) loop has no listener, so docker stop will hard-kill it (after the compose default 10s grace period), potentially mid-HTTP-call, leaving a heartbeat but no completed execution. Add SIGTERM handling: stop pulling new jobs, let the in-flight one finish (or hit the timeout), then exit — the reaper covers the rest.
 

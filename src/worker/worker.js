@@ -14,8 +14,10 @@ import {
   getJobById,
 } from "../repositories/httpJob.repository.js";
 
+const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const HEARTBEAT_SET_KEY = "execution:heartbeats";
+const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
 
 function buildUrl(execution) {
   const url = new URL(execution.url);
@@ -208,13 +210,16 @@ async function clearHeartBeats(executionId) {
 
 export async function startWorker() {
   logger.info("[worker] started, waiting for executions");
-  const WORKER_ID = `${os.hostname()}:${process.pid}`;
-  // Simple blocking-pop loop. BRPOP blocks the connection until an item
-  // arrives or timeout elapses - cheap on Redis, no busy-polling.
   for (;;) {
-    const result = await redis.brpop(EXECUTION_QUEUE_KEY, 5); // 5s timeout, then loop again
-    if (!result) continue; // timed out, nothing to do
-    const [, data] = result;
+    const data = await redis.blmove(
+      EXECUTION_QUEUE_KEY,
+      PROCESSING_QUEUE_KEY,
+      "RIGHT",
+      "LEFT",
+      5,
+    );
+
+    if (!data) continue;
     const job = JSON.parse(data);
     await sendHeartBeat(job.execution_id);
     const heartbeat = setInterval(() => {
@@ -228,6 +233,7 @@ export async function startWorker() {
     } finally {
       clearInterval(heartbeat);
       await clearHeartBeats(job.execution_id);
+      await redis.lrem(PROCESSING_QUEUE_KEY, 1, data);
     }
   }
 }

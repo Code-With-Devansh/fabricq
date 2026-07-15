@@ -1,9 +1,11 @@
 import IORedis from "ioredis";
 import logger from "./logger/index.js";
 import config from "./index.js";
+if (!config.redis.url) {
+  logger.fatal("[redis] REDIS_URL is not set");
+  process.exit(1);
+}
 const options = {
-  port: config.redis.port,
-  host: config.redis.host,
   retryStrategy: (times) => {
     if (times > 10) {
       logger.fatal("[redis] max reconnection attempts reached");
@@ -14,10 +16,8 @@ const options = {
   connectTimeout: 10000,
   maxRetriesPerRequest: null,
 };
-if (config.redis.password) {
-  options.password = config.redis.password;
-}
-const client = new IORedis(options);
+
+const client = new IORedis(config.redis.url, options);
 
 client.on("connect", () => logger.info("[redis] connected"));
 client.on("reconnecting", () => logger.warn("[redis] reconnecting..."));

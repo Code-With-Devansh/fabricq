@@ -17,12 +17,13 @@ services:
     image: redis:8-alpine
     container_name: fabricq-redis
     restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
     networks:
       - internal
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,7 +48,7 @@ services:
       PORT: 3000
 
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
 
   scheduler:
     build:
@@ -63,8 +64,8 @@ services:
       - internal
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
-      REDIS_URL: redis://redis:6379
-    command: node src/scheduler_process.js
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    command: node src/scheduler-process.js
 
   worker:
     build:
@@ -79,10 +80,8 @@ services:
       - internal
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
-      REDIS_URL: redis://redis:6379
-    command: node src/worker_process.js
-    # No container_name - scale with: docker compose up -d --scale worker=3
-    # (deploy.replicas is a Swarm-only field and is ignored by plain `docker compose up`)
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    command: node src/worker-process.js
 
 volumes:
   postgres_data:
