@@ -66,6 +66,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
     command: node src/scheduler-process.js
+    stop_grace_period: 20s
 
   worker:
     build:
@@ -82,6 +83,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
     command: node src/worker-process.js
+    stop_grace_period: 160s
 
 volumes:
   postgres_data:

@@ -74,6 +74,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
       REDIS_URL: redis://redis:6379
     command: sh -c "npm install && npx nodemon --legacy-watch src/scheduler_process.js"
+    stop_grace_period: 20s
 
   worker:
     build:
@@ -94,8 +95,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
       REDIS_URL: redis://redis:6379
     command: sh -c "npm install && npx nodemon --legacy-watch src/worker_process.js"
-    # To run more than one worker in dev, drop container_name and use:
-    # docker compose -f docker-compose.dev.yml up -d --scale worker=2
+    stop_grace_period: 160s
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: pgadmin

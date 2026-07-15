@@ -138,8 +138,6 @@ async function executeHttpJob(execution) {
 }
 
 async function handleExecution(job) {
-  await markExecutionRunning(job.execution_id);
-
   const result = await executeHttpJob(job);
 
   const client = await pool.connect();
@@ -183,6 +181,7 @@ async function handleExecution(job) {
       { err, executionId: job.execution_id },
       "[worker] failed to update job after execution",
     );
+    throw err;
   } finally {
     client.release();
   }
@@ -208,10 +207,32 @@ async function clearHeartBeats(executionId) {
   await redis.zrem(HEARTBEAT_SET_KEY, executionId);
 }
 
+let shuttingDown = false;
+let currentExecution = null; // promise for whatever job is in-flight right now
+
+// Called by worker_process.js on SIGTERM/SIGINT. Flips the flag the main
+// loop checks between jobs (so no *new* job is pulled off the queue), then
+// waits for whatever is currently running to finish naturally - either it
+// completes, or it hits its own AbortController timeout (max 120s per the
+// timeout_ms validator). We deliberately do NOT abort the in-flight job
+// ourselves: killing it early would leave the execution row stuck at
+// "running" with no result, which is exactly the crash-recovery gap we're
+// trying to avoid, not reproduce on purpose.
+export async function stopWorker() {
+  shuttingDown = true;
+  if (currentExecution) {
+    logger.info(
+      "[worker] shutdown requested, waiting for in-flight execution to finish",
+    );
+    await currentExecution.catch(() => {}); // already logged inside handleExecution
+  }
+  logger.info("[worker] shutdown: no in-flight execution, safe to exit");
+}
+
 export async function startWorker() {
   logger.info("[worker] started, waiting for executions");
-  for (;;) {
-    const data = await redis.blmove(
+  while (!shuttingDown) {
+    const result = await redis.blmove(
       EXECUTION_QUEUE_KEY,
       PROCESSING_QUEUE_KEY,
       "RIGHT",
@@ -219,21 +240,30 @@ export async function startWorker() {
       5,
     );
 
-    if (!data) continue;
-    const job = JSON.parse(data);
+    if (!result) continue; // timed out, nothing to do
+    if (shuttingDown) {
+      logger.warn(
+        "[worker] popped a job after shutdown was requested, finishing it anyway",
+      );
+    }
+    await markExecutionRunning(job.execution_id);
     await sendHeartBeat(job.execution_id);
     const heartbeat = setInterval(() => {
       sendHeartBeat(job.execution_id);
     }, 10_000);
-    try {
-      await handleExecution(job);
-    } catch (err) {
+    const job = JSON.parse(result);
+    currentExecution = handleExecution(job).catch((err) => {
       logger.error({ err }, "[worker] loop error, retrying in 1s");
-      await new Promise((r) => setTimeout(r, 1000));
+      return new Promise((r) => setTimeout(r, 1000));
+    });
+    try {
+      await currentExecution;
+      await redis.lrem(PROCESSING_QUEUE_KEY, 1, result);
     } finally {
       clearInterval(heartbeat);
       await clearHeartBeats(job.execution_id);
-      await redis.lrem(PROCESSING_QUEUE_KEY, 1, data);
+      currentExecution = null;
     }
   }
+  logger.info("[worker] loop exited, no longer pulling new jobs");
 }
