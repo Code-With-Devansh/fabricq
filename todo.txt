@@ -1,14 +1,7 @@
 2. make watchdog and reapers
 
-3.anything else instead of random uuid. (i hate those dashes and id is too long).
-
-4. Graceful shutdown exists for the API (server.js), but not for worker.js or the scheduler. docker-compose down/rolling deploys send SIGTERM — the worker's for(;;) loop has no listener, so docker stop will hard-kill it (after the compose default 10s grace period), potentially mid-HTTP-call, leaving a heartbeat but no completed execution. Add SIGTERM handling: stop pulling new jobs, let the in-flight one finish (or hit the timeout), then exit — the reaper covers the rest.
-
 5. Retries/backoff works but is a flat per-job backoff_seconds, not exponential. Fine if that's intentional, but if you want the "configurable backoff" to mean exponential/jittered, that logic needs to live in the retry UPDATE in worker.js (currently just now() + backoff_seconds).
 
-6. incrementAttempts is defined, imported into worker.js, but never called (commented out) 
-
-7. getExecutionWithJob and getJobById are imported into worker.js but unused 
 
 8. Production Postgres pool (config/db.js) has no max, idleTimeoutMillis, or ssl config — most managed Postgres (RDS, Supabase, Neon) requires ssl: { rejectUnauthorized: false } or it won't connect at all.
 

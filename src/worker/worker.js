@@ -4,12 +4,10 @@ import logger from "../config/logger/index.js";
 import os from "os";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import {
-  getExecutionWithJob,
   markExecutionRunning,
   completeExecution,
 } from "../repositories/execution.repository.js";
 import {
-  incrementAttempts,
   finalizeJobRun,
   getJobById,
 } from "../repositories/httpJob.repository.js";
@@ -145,7 +143,6 @@ async function handleExecution(job) {
     await client.query("BEGIN");
     await completeExecution(client, job.execution_id, result);
 
-    // await incrementAttempts(client, job.job_id);
 
     const isRecurring = job.schedule_type === "CRON";
     const exhaustedRetries = job.attempts >= job.max_attempts;

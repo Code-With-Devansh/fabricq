@@ -132,13 +132,6 @@ export async function finalizeJobRun(client, jobId, { success, isRecurring }) {
   }
 }
  
-export async function incrementAttempts(client, jobId) {
-  await client.query(
-    `UPDATE http_jobs SET attempts = attempts + 1, updated_at = now() WHERE job_id = $1`,
-    [jobId]
-  );
-}
- 
 export async function getJobById(client, jobId) {
   const { rows } = await client.query(
     `SELECT * FROM http_jobs WHERE job_id = $1`,

@@ -46,22 +46,6 @@ export async function completeExecution(
   return rows[0];
 }
 
-export async function getExecutionWithJob(executionId) {
-  const { rows } = await pool.query(
-    `SELECT
-       e.execution_id, e.job_id, e.attempt, e.status AS execution_status,
-       e.scheduled_time,
-       j.method, j.url, j.body, j.headers, j.max_attempts,
-       j.backoff_seconds, j.schedule_type,
-       j.query_params, j.body_type, j.auth_type, j.auth_config,
-       j.redirect_mode, j.timeout_ms
-     FROM job_executions e
-     JOIN http_jobs j ON j.job_id = e.job_id
-     WHERE e.execution_id = $1`,
-    [executionId]
-  );
-  return rows[0] ?? null;
-}
 
 export async function getExecutionById(executionId) {
   const { rows } = await pool.query(
