@@ -39,8 +39,12 @@ services:
 
     env_file: .env
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - .:/usr/src/app
       - node_modules:/usr/src/app/node_modules
@@ -109,7 +113,24 @@ services:
     - internal
     volumes:
       - pgadmin_data:/var/lib/pgadmin
-
+  migrate:
+    build:
+      context: .
+      dockerfile: dockerfile.dev
+    container_name: fabricq-migrate
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+    volumes:
+      - .:/usr/src/app
+      - node_modules:/usr/src/app/node_modules
+    command: sh -c "npm install && npm run migrate"
+    restart: "no"
+    networks:
+      - internal
 volumes:
   pgadmin_data:
   postgres_data:

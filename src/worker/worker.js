@@ -14,7 +14,7 @@ import {
 
 const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
-const HEARTBEAT_SET_KEY = "execution:heartbeats";
+export const HEARTBEAT_SET_KEY = "execution:heartbeats";
 const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
 
 function buildUrl(execution) {
@@ -137,7 +137,6 @@ async function executeHttpJob(execution) {
 
 async function handleExecution(job) {
   const result = await executeHttpJob(job);
-
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -243,12 +242,12 @@ export async function startWorker() {
         "[worker] popped a job after shutdown was requested, finishing it anyway",
       );
     }
+    const job = JSON.parse(result);
     await markExecutionRunning(job.execution_id);
     await sendHeartBeat(job.execution_id);
     const heartbeat = setInterval(() => {
       sendHeartBeat(job.execution_id);
     }, 10_000);
-    const job = JSON.parse(result);
     currentExecution = handleExecution(job).catch((err) => {
       logger.error({ err }, "[worker] loop error, retrying in 1s");
       return new Promise((r) => setTimeout(r, 1000));

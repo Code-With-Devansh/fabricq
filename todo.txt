@@ -1,9 +1,8 @@
 2. make watchdog and reapers
 
+3. Execution lease → determines whether a specific job can be recovered. the job lock type  ref : https://pixel-mart.in/1s07K
+
 5. Retries/backoff works but is a flat per-job backoff_seconds, not exponential. Fine if that's intentional, but if you want the "configurable backoff" to mean exponential/jittered, that logic needs to live in the retry UPDATE in worker.js (currently just now() + backoff_seconds).
-
-
-8. Production Postgres pool (config/db.js) has no max, idleTimeoutMillis, or ssl config — most managed Postgres (RDS, Supabase, Neon) requires ssl: { rejectUnauthorized: false } or it won't connect at all.
 
 9. productionLogger.js has no redact config (the dev logger does). Since auth_config can contain bearer tokens/passwords and gets logged in job objects, add the same redaction (auth_config.token, auth_config.password, auth_config.value) to the prod logger.
 
