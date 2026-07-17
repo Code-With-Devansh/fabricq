@@ -62,7 +62,10 @@ async function lookupProcessingEntry(executionId) {
       job: JSON.parse(raw),
     };
   } catch (err) {
-    logger.error({ err, executionId }, "[recovery] unparseable processing index entry");
+    logger.error(
+      { err, executionId },
+      "[recovery] unparseable processing index entry",
+    );
     return null;
   }
 }
@@ -123,7 +126,10 @@ async function rescheduleForRetry(client, jobId) {
 async function recoverExecution(executionId) {
   const token = await acquireLock(executionId);
   if (!token) {
-    logger.debug({ executionId }, "[recovery] lock held by another recovery run, skipping");
+    logger.debug(
+      { executionId },
+      "[recovery] lock held by another recovery run, skipping",
+    );
     return;
   }
 
@@ -132,7 +138,10 @@ async function recoverExecution(executionId) {
     // heartbeated again between our scan and acquiring the lock.
     const score = await redis.zscore(HEARTBEAT_SET_KEY, executionId);
     if (score !== null && Number(score) > Date.now() - HEARTBEAT_TIMEOUT_MS) {
-      logger.debug({ executionId }, "[recovery] heartbeat is fresh again, worker is alive");
+      logger.debug(
+        { executionId },
+        "[recovery] heartbeat is fresh again, worker is alive",
+      );
       return;
     }
 
@@ -144,15 +153,22 @@ async function recoverExecution(executionId) {
       entry = await findInProcessingListsFallback(executionId);
     }
     if (!entry) {
-      logger.warn({ executionId }, "[recovery] stale heartbeat with no matching processing entry, clearing heartbeat");
+      logger.warn(
+        { executionId },
+        "[recovery] stale heartbeat with no matching processing entry, clearing heartbeat",
+      );
       await redis.zrem(HEARTBEAT_SET_KEY, executionId);
       return;
     }
 
     const execution = await getExecutionById(executionId);
     if (!execution) {
-      logger.error({ executionId }, "[recovery] execution not found in postgres, dropping orphaned entry");
-      await redis.multi()
+      logger.error(
+        { executionId },
+        "[recovery] execution not found in postgres, dropping orphaned entry",
+      );
+      await redis
+        .multi()
         .lrem(entry.listKey, 1, entry.raw)
         .zrem(HEARTBEAT_SET_KEY, executionId)
         .hdel(PROCESSING_INDEX_KEY, executionId)
@@ -164,8 +180,12 @@ async function recoverExecution(executionId) {
       // Worker completed the HTTP call and updated Postgres, but crashed
       // before it could LREM the processing list / clear the heartbeat.
       // The execution result is already correct - just tidy up Redis.
-      logger.info({ executionId, status: execution.status }, "[recovery] execution already finished, cleaning up Redis only");
-      await redis.multi()
+      logger.info(
+        { executionId, status: execution.status },
+        "[recovery] execution already finished, cleaning up Redis only",
+      );
+      await redis
+        .multi()
         .lrem(entry.listKey, 1, entry.raw)
         .zrem(HEARTBEAT_SET_KEY, executionId)
         .hdel(PROCESSING_INDEX_KEY, executionId)
@@ -179,10 +199,15 @@ async function recoverExecution(executionId) {
     try {
       await client.query("BEGIN");
 
-      await completeExecution(client, executionId, {
-        success: false,
-        error: "Execution abandoned: worker heartbeat lost",
-      });
+      await completeExecution(
+        client,
+        executionId,
+        {
+          success: false,
+          error: "Worker crashed executing this job.",
+        },
+        null,
+      );
 
       const isRecurring = job.schedule_type === "CRON";
       const exhaustedRetries = job.attempts >= job.max_attempts;
@@ -199,13 +224,17 @@ async function recoverExecution(executionId) {
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
-      logger.error({ err, executionId, jobId: job.job_id }, "[recovery] failed to recover abandoned execution, leaving in place for next cycle");
+      logger.error(
+        { err, executionId, jobId: job.job_id },
+        "[recovery] failed to recover abandoned execution, leaving in place for next cycle",
+      );
       return;
     } finally {
       client.release();
     }
 
-    await redis.multi()
+    await redis
+      .multi()
       .lrem(entry.listKey, 1, entry.raw)
       .zrem(HEARTBEAT_SET_KEY, executionId)
       .hdel(PROCESSING_INDEX_KEY, executionId)
@@ -230,7 +259,10 @@ export async function runRecoveryCycle() {
     try {
       await recoverExecution(executionId);
     } catch (err) {
-      logger.error({ err, executionId }, "[recovery] unexpected error recovering execution");
+      logger.error(
+        { err, executionId },
+        "[recovery] unexpected error recovering execution",
+      );
     }
   }
 }

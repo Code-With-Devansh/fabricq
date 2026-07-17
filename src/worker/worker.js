@@ -145,7 +145,7 @@ async function handleExecution(job) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await completeExecution(client, job.execution_id, result);
+    await completeExecution(client, job.execution_id, result, WORKER_ID);
 
 
     const isRecurring = job.schedule_type === "CRON";

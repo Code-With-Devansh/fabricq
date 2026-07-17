@@ -24,7 +24,8 @@ export async function markExecutionRunning(executionId) {
 export async function completeExecution(
   client,
   executionId,
-  { success, responseStatus = null, responseBody = null, error = null }
+  { success, responseStatus = null, responseBody = null, error = null },
+  WORKER_ID
 ) {
   const { rows } = await client.query(
     `UPDATE job_executions
@@ -33,6 +34,7 @@ export async function completeExecution(
          response_status = $3,
          response = $4,
          error = $5
+         worker_id = $6
      WHERE execution_id = $1
      RETURNING *`,
     [
@@ -41,6 +43,7 @@ export async function completeExecution(
       responseStatus,
       responseBody === null ? null : JSON.stringify({ body: responseBody }),
       error === null ? null : JSON.stringify({ message: error }),
+      WORKER_ID
     ]
   );
   return rows[0];
