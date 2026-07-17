@@ -1,3 +1,6 @@
+1. user can queue job that has already been expired
+2. table contains the column worker id that is not being populated.
+3. dont just reattempt the jobs just mark the job as failed in redis then a retry scheduler will retry it based on configured retry method.
 2. make watchdog and reapers
 
 3. Execution lease → determines whether a specific job can be recovered. the job lock type  ref : https://pixel-mart.in/1s07K
@@ -27,3 +30,6 @@
 
 scaling issues:
 1. One thing worth your attention: the lock's PX 15000 is shorter than a possible slow Postgres transaction — if recoverExecution ever takes longer than that, a second recovery process could theoretically jump in before finally releases it. Given your current single-instance deployment this is a non-issue, but if you ever run recovery as more than one replica, bump LOCK_TTL_MS or refresh the lock mid-operation.
+
+2. The old SCAN fallback isn't gone, just demoted. It only fires for an execution that's stale and missing from the index — the narrow crash window between the worker's BLMOVE and its follow-up HSET. That should be rare (order of one process crash landing in a ~1ms gap), so its O(N) cost is now the exception path, not the steady state.
+

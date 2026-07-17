@@ -16,6 +16,11 @@ const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 export const HEARTBEAT_SET_KEY = "execution:heartbeats";
 const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
+// Global execution_id -> {listKey, raw} index. Recovery point-looks-up stale
+// heartbeats here (O(1)) instead of SCANning every worker's processing list.
+// The per-worker list stays around purely as the BLMOVE atomic handoff target -
+// this index is just a fast pointer into it.
+export const PROCESSING_INDEX_KEY = `${EXECUTION_QUEUE_KEY}:processing:index`;
 
 function buildUrl(execution) {
   const url = new URL(execution.url);
@@ -243,6 +248,19 @@ export async function startWorker() {
       );
     }
     const job = JSON.parse(result);
+    // BLMOVE already atomically handed the job to our processing list - it
+    // cannot be lost from here on. This index write is best-effort speed-up
+    // for recovery's lookup, not a safety requirement: if the process dies
+    // before this line lands, the job is still sitting safely in
+    // PROCESSING_QUEUE_KEY for the (rare) cold-path fallback to find.
+    // listKey is deterministic from workerId (processing:<workerId>), so we
+    // only store the id, not the full key - and `job` is just a re-parse of
+    // `raw` away, so we skip storing it twice too.
+    await redis.hset(
+      PROCESSING_INDEX_KEY,
+      job.execution_id,
+      JSON.stringify({ workerId: WORKER_ID, raw: result }),
+    );
     await markExecutionRunning(job.execution_id);
     await sendHeartBeat(job.execution_id);
     const heartbeat = setInterval(() => {
@@ -258,6 +276,7 @@ export async function startWorker() {
     } finally {
       clearInterval(heartbeat);
       await clearHeartBeats(job.execution_id);
+      await redis.hdel(PROCESSING_INDEX_KEY, job.execution_id);
       currentExecution = null;
     }
   }

@@ -3,7 +3,7 @@ import redis from "../config/redis.js";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
-import { HEARTBEAT_SET_KEY } from "../worker/worker.js";
+import { HEARTBEAT_SET_KEY, PROCESSING_INDEX_KEY } from "../worker/worker.js";
 import {
   completeExecution,
   getExecutionById,
@@ -47,14 +47,32 @@ async function getStaleExecutionIds() {
   return redis.zrangebyscore(HEARTBEAT_SET_KEY, 0, cutoff);
 }
 
-// Every worker owns its own processing list (fabricq:executions:processing:<workerId>),
-// so there's no single key to inspect - we have to fan out with SCAN and
-// build execution_id -> {listKey, raw, job} so a stale heartbeat can be
-// matched back to the exact list entry it needs to be removed from.
-async function buildProcessingIndex() {
-  const index = new Map();
-  let cursor = "0";
+// O(1) point lookup against the global index the worker maintains alongside
+// its per-worker processing list. This is the hot path - no SCAN involved.
+// listKey is deterministic from workerId, so we reconstruct it rather than
+// storing it; job is reconstructed by re-parsing raw for the same reason.
+async function lookupProcessingEntry(executionId) {
+  const indexed = await redis.hget(PROCESSING_INDEX_KEY, executionId);
+  if (!indexed) return null;
+  try {
+    const { workerId, raw } = JSON.parse(indexed);
+    return {
+      listKey: `${EXECUTION_QUEUE_KEY}:processing:${workerId}`,
+      raw,
+      job: JSON.parse(raw),
+    };
+  } catch (err) {
+    logger.error({ err, executionId }, "[recovery] unparseable processing index entry");
+    return null;
+  }
+}
 
+// Cold-path fallback for the narrow window where a worker died between its
+// BLMOVE (job safely in its processing list) and the follow-up HSET into
+// PROCESSING_INDEX_KEY. Only runs for ids the index didn't know about, which
+// should be rare, so the SCAN cost here is acceptable.
+async function findInProcessingListsFallback(executionId) {
+  let cursor = "0";
   do {
     const [nextCursor, keys] = await redis.scan(
       cursor,
@@ -71,18 +89,17 @@ async function buildProcessingIndex() {
         let job;
         try {
           job = JSON.parse(raw);
-        } catch (err) {
-          logger.error({ err, listKey, raw }, "[recovery] unparseable processing entry, leaving in place");
+        } catch {
           continue;
         }
-        if (job.execution_id) {
-          index.set(job.execution_id, { listKey, raw, job });
+        if (job.execution_id === executionId) {
+          return { listKey, raw, job };
         }
       }
     }
   } while (cursor !== "0");
 
-  return index;
+  return null;
 }
 
 // Requeues a non-recurring job for another attempt after backoff. Mirrors
@@ -103,7 +120,7 @@ async function rescheduleForRetry(client, jobId) {
 // Handles a single stale execution: decide whether the worker actually
 // finished before dying (nothing to do but tidy Redis) or genuinely
 // abandoned it mid-flight (fail the execution, retry/finalize the job).
-async function recoverExecution(executionId, processingIndex) {
+async function recoverExecution(executionId) {
   const token = await acquireLock(executionId);
   if (!token) {
     logger.debug({ executionId }, "[recovery] lock held by another recovery run, skipping");
@@ -119,11 +136,14 @@ async function recoverExecution(executionId, processingIndex) {
       return;
     }
 
-    const entry = processingIndex.get(executionId);
+    let entry = await lookupProcessingEntry(executionId);
     if (!entry) {
-      // Heartbeat says stale but there's no processing-list entry anywhere.
-      // Most likely the worker finished and removed itself right as we
-      // were scanning. Nothing left to recover, just drop the heartbeat.
+      // Not in the index - either genuinely gone (worker finished and
+      // cleaned up right as we checked) or it hit the narrow BLMOVE->HSET
+      // crash window. Fall back to the slow scan before giving up.
+      entry = await findInProcessingListsFallback(executionId);
+    }
+    if (!entry) {
       logger.warn({ executionId }, "[recovery] stale heartbeat with no matching processing entry, clearing heartbeat");
       await redis.zrem(HEARTBEAT_SET_KEY, executionId);
       return;
@@ -135,6 +155,7 @@ async function recoverExecution(executionId, processingIndex) {
       await redis.multi()
         .lrem(entry.listKey, 1, entry.raw)
         .zrem(HEARTBEAT_SET_KEY, executionId)
+        .hdel(PROCESSING_INDEX_KEY, executionId)
         .exec();
       return;
     }
@@ -147,6 +168,7 @@ async function recoverExecution(executionId, processingIndex) {
       await redis.multi()
         .lrem(entry.listKey, 1, entry.raw)
         .zrem(HEARTBEAT_SET_KEY, executionId)
+        .hdel(PROCESSING_INDEX_KEY, executionId)
         .exec();
       return;
     }
@@ -186,6 +208,7 @@ async function recoverExecution(executionId, processingIndex) {
     await redis.multi()
       .lrem(entry.listKey, 1, entry.raw)
       .zrem(HEARTBEAT_SET_KEY, executionId)
+      .hdel(PROCESSING_INDEX_KEY, executionId)
       .exec();
 
     logger.warn(
@@ -203,11 +226,9 @@ export async function runRecoveryCycle() {
 
   logger.info({ count: staleIds.length }, "[recovery] found stale executions");
 
-  const processingIndex = await buildProcessingIndex();
-
   for (const executionId of staleIds) {
     try {
-      await recoverExecution(executionId, processingIndex);
+      await recoverExecution(executionId);
     } catch (err) {
       logger.error({ err, executionId }, "[recovery] unexpected error recovering execution");
     }
