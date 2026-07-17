@@ -23,3 +23,7 @@
 17. No metrics/observability: queue depth, in-flight executions, failure rate, and job lag (scheduled vs actually started) are all things you'll want dashboards/alerts on before calling this production-grade — even basic Prometheus counters exported from the worker/scheduler would go a long way.
 
 18. Single scheduler container is fine correctness-wise (SKIP LOCKED means you could even run several), but there's no documented scale-out for it in compose the way there is for worker — worth deciding if you want scheduler redundancy or accept it as a single point of latency (not correctness, since a restart just resumes polling).
+
+
+scaling issues:
+1. One thing worth your attention: the lock's PX 15000 is shorter than a possible slow Postgres transaction — if recoverExecution ever takes longer than that, a second recovery process could theoretically jump in before finally releases it. Given your current single-instance deployment this is a non-issue, but if you ever run recovery as more than one replica, bump LOCK_TTL_MS or refresh the lock mid-operation.
