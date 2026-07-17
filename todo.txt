@@ -1,5 +1,5 @@
 1. user can queue job that has already been expired
-2. table contains the column worker id that is not being populated.
+2. execution table contains the column worker id that is not being populated.
 3. dont just reattempt the jobs just mark the job as failed in redis then a retry scheduler will retry it based on configured retry method.
 2. make watchdog and reapers
 

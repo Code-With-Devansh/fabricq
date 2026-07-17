@@ -1,0 +1,105 @@
+{
+  "info": {
+    "_postman_id": "2420a955-914c-4d5a-b269-15922eca2635",
+    "name": "job Scheduler",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "create Job",
+      "id": "f8c88018-3c1c-4beb-9035-8aaa755f4868",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"https://pixel-mart.in/api/health\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"ONCE\",\r\n    \"run_at\": 1783784885\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "http://localhost:3000/jobs/upload",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "jobs",
+            "upload"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "delete job",
+      "id": "d2f0c046-a8cc-434a-8d1b-32bd520b0ea3",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"email\":\"devansharora29476@gmail.com\", \r\n    \"password\":\"newpassword\"\r\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/jobs/04d22d88-4e9a-4f99-acbe-3c2114f29de1",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "jobs",
+            "04d22d88-4e9a-4f99-acbe-3c2114f29de1"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "execution history",
+      "id": "6f3924d8-9d7d-4ada-b3fd-5da1ab4a3e9a",
+      "protocolProfileBehavior": {
+        "disableBodyPruning": true
+      },
+      "request": {
+        "method": "GET",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"http://10.65.21.21:3000/health\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"ONCE\",\r\n    \"run_at\": 1783619386\r\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/jobs/29625b8a-57c6-4afd-90c0-0de7b2b9bab5/executions",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "jobs",
+            "29625b8a-57c6-4afd-90c0-0de7b2b9bab5",
+            "executions"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "get all jobs",
+      "id": "d2e1eeca-8ac1-44a1-ac26-14e5290c9885",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": ""
+        }
+      },
+      "response": []
+    }
+  ]
+}
