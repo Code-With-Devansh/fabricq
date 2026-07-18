@@ -184,7 +184,7 @@ async function recoverExecution(executionId) {
       await completeExecution(client, executionId, {
         success: false,
         error: "Execution abandoned: worker heartbeat lost",
-      });
+      }, null);
 
       const isRecurring = job.schedule_type === "CRON";
       // Same off-by-one fix as worker.js: count this attempt before
