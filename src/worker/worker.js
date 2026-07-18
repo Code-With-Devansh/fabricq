@@ -16,10 +16,6 @@ const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 export const HEARTBEAT_SET_KEY = "execution:heartbeats";
 const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
-// Global execution_id -> {listKey, raw} index. Recovery point-looks-up stale
-// heartbeats here (O(1)) instead of SCANning every worker's processing list.
-// The per-worker list stays around purely as the BLMOVE atomic handoff target -
-// this index is just a fast pointer into it.
 export const PROCESSING_INDEX_KEY = `${EXECUTION_QUEUE_KEY}:processing:index`;
 
 function buildUrl(execution) {
@@ -145,15 +141,14 @@ async function handleExecution(job) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await completeExecution(client, job.execution_id, result, WORKER_ID);
+    await completeExecution(client, job.execution_id, result);
 
 
     const isRecurring = job.schedule_type === "CRON";
-    const exhaustedRetries = job.attempts >= job.max_attempts;
+    const exhaustedRetries = job.attempts + 1 >= job.max_attempts;
 
     if (result.success) {
       await finalizeJobRun(client, job.job_id, {
-        success: true,
         isRecurring,
       });
     } else if (!isRecurring && !exhaustedRetries) {
@@ -161,16 +156,15 @@ async function handleExecution(job) {
 
       await client.query(
         `UPDATE http_jobs
-         SET status = 'PENDING',
-             attempts = attempts + 1,
+         SET attempts = attempts + 1,
              next_run = now() + (backoff_seconds || ' seconds')::interval,
+             locked_at = NULL,
              updated_at = now()
          WHERE job_id = $1`,
         [job.job_id],
       );
     } else {
       await finalizeJobRun(client, job.job_id, {
-        success: false,
         isRecurring,
       });
     }
@@ -209,16 +203,7 @@ async function clearHeartBeats(executionId) {
 }
 
 let shuttingDown = false;
-let currentExecution = null; // promise for whatever job is in-flight right now
-
-// Called by worker_process.js on SIGTERM/SIGINT. Flips the flag the main
-// loop checks between jobs (so no *new* job is pulled off the queue), then
-// waits for whatever is currently running to finish naturally - either it
-// completes, or it hits its own AbortController timeout (max 120s per the
-// timeout_ms validator). We deliberately do NOT abort the in-flight job
-// ourselves: killing it early would leave the execution row stuck at
-// "running" with no result, which is exactly the crash-recovery gap we're
-// trying to avoid, not reproduce on purpose.
+let currentExecution = null;
 export async function stopWorker() {
   shuttingDown = true;
   if (currentExecution) {
@@ -248,14 +233,6 @@ export async function startWorker() {
       );
     }
     const job = JSON.parse(result);
-    // BLMOVE already atomically handed the job to our processing list - it
-    // cannot be lost from here on. This index write is best-effort speed-up
-    // for recovery's lookup, not a safety requirement: if the process dies
-    // before this line lands, the job is still sitting safely in
-    // PROCESSING_QUEUE_KEY for the (rare) cold-path fallback to find.
-    // listKey is deterministic from workerId (processing:<workerId>), so we
-    // only store the id, not the full key - and `job` is just a re-parse of
-    // `raw` away, so we skip storing it twice too.
     await redis.hset(
       PROCESSING_INDEX_KEY,
       job.execution_id,

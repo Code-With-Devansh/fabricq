@@ -15,8 +15,6 @@ import {
   listJobsQuerySchema,
   paginationQuerySchema,
 } from "../validators/http_job.js";
-
-
 export const uploadJob = asyncHandler(async (req, res) => {
   const payload = req.body;
   const validated = createJobSchema.safeParse(payload);
@@ -35,8 +33,8 @@ export const getJobs = asyncHandler(async (req, res) => {
     throw new AppError("Invalid query parameters", 400, validated.error.flatten());
   }
 
-  const { status, schedule_type, limit, offset } = validated.data;
-  const { jobs, total } = await getJobsService({ status, schedule_type, limit, offset });
+  const { status, enabled, schedule_type, limit, offset } = validated.data;
+  const { jobs, total } = await getJobsService({ status, enabled, schedule_type, limit, offset });
 
   return res.status(200).json({
     success: true,

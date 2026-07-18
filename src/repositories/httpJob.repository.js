@@ -10,7 +10,7 @@ export async function createJob(job) {
       schedule_type,
       run_at,
       cron_expression,
-      status,
+      enabled,
       max_attempts,
       attempts,
       backoff_seconds,
@@ -53,7 +53,7 @@ export async function createJob(job) {
     job.schedule_type,
     job.run_at ?? null,
     job.cron_expression ?? null,
-    job.status,
+    job.enabled ?? true,
     job.max_attempts,
     job.attempts,
     job.backoff_seconds,
@@ -78,7 +78,8 @@ export async function claimDueJobs(client, limit = 100) {
     WHERE job_id IN (
       SELECT job_id
       FROM http_jobs
-      WHERE status = 'PENDING'
+      WHERE enabled
+        AND next_run IS NOT NULL
         AND next_run <= now()
         AND (locked_at IS NULL OR locked_at < now() - interval '1 minute')
       ORDER BY next_run
@@ -92,11 +93,6 @@ export async function claimDueJobs(client, limit = 100) {
   return rows;
 }
  
-// Called after an execution row has been created for a job.
-// - CRON jobs: advance next_run to the next cron occurrence, unlock, stay PENDING.
-// - ONCE jobs: no more runs due; unlock and flip to a terminal-ish state.
-//   (Terminal status here just means "not due again" - the execution's
-//   own status is what tracks success/failure of the actual HTTP call.)
 export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) {
   if (isRecurring) {
     await client.query(
@@ -105,29 +101,21 @@ export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) 
        WHERE job_id = $1`,
       [jobId, nextRun]
     );
-  } else {
-    await client.query(
-      `UPDATE http_jobs
-       SET status = 'RUNNING', locked_at = NULL, updated_at = now()
-       WHERE job_id = $1`,
-      [jobId]
-    );
   }
 }
  
-// Worker calls this once it knows the outcome of a ONCE job's single execution,
-// or a CRON job run that has exhausted its retries for this occurrence.
-export async function finalizeJobRun(client, jobId, { success, isRecurring }) {
+export async function finalizeJobRun(client, jobId, { isRecurring }) {
   if (isRecurring) {
-    // recurring jobs go back to PENDING regardless of outcome - they'll fire again
     await client.query(
-      `UPDATE http_jobs SET attempts = attempts + 1, status = 'PENDING', updated_at = now() WHERE job_id = $1`,
+      `UPDATE http_jobs SET attempts = attempts + 1, updated_at = now() WHERE job_id = $1`,
       [jobId]
     );
   } else {
     await client.query(
-      `UPDATE http_jobs SET attempts = attempts + 1, status = $2, updated_at = now() WHERE job_id = $1`,
-      [jobId, success ? "COMPLETED" : "FAILED"]
+      `UPDATE http_jobs
+       SET attempts = attempts + 1, next_run = NULL, locked_at = NULL, updated_at = now()
+       WHERE job_id = $1`,
+      [jobId]
     );
   }
 }
@@ -140,8 +128,6 @@ export async function getJobById(client, jobId) {
   return rows[0] ?? null;
 }
 
-// Plain-pool variant for read paths that don't run inside the
-// scheduler/worker's transaction (controllers call this one).
 export async function findJobById(jobId) {
   const { rows } = await pool.query(
     `SELECT * FROM http_jobs WHERE job_id = $1`,
@@ -150,13 +136,26 @@ export async function findJobById(jobId) {
   return rows[0] ?? null;
 }
 
-export async function listJobs({ status, scheduleType, limit, offset }) {
+const OUTCOME_STATUSES = new Set(["COMPLETED", "FAILED"]);
+
+export async function listJobs({ status, enabled, scheduleType, limit, offset }) {
   const conditions = [];
   const values = [];
 
-  if (status) {
-    values.push(status);
-    conditions.push(`status = $${values.length}`);
+  if (status && OUTCOME_STATUSES.has(status)) {
+    values.push(status === "COMPLETED" ? "success" : "failed");
+    conditions.push(`
+      (
+        SELECT je.status FROM job_executions je
+        WHERE je.job_id = http_jobs.job_id
+        ORDER BY je.created_at DESC
+        LIMIT 1
+      ) = $${values.length}
+    `);
+  }
+  if (typeof enabled === "boolean") {
+    values.push(enabled);
+    conditions.push(`enabled = $${values.length}`);
   }
   if (scheduleType) {
     values.push(scheduleType);
@@ -185,9 +184,6 @@ export async function listJobs({ status, scheduleType, limit, offset }) {
   return { jobs: rows, total: countRows[0].count };
 }
 
-// Whitelisted, dynamic UPDATE: only touches columns actually present in `fields`.
-// Recomputes next_run when run_at/cron_expression change so the scheduler
-// doesn't keep firing on a stale schedule.
 export async function updateJob(jobId, fields) {
   const allowedColumns = [
     "method",
@@ -196,7 +192,7 @@ export async function updateJob(jobId, fields) {
     "headers",
     "max_attempts",
     "backoff_seconds",
-    "status",
+    "enabled",
     "next_run",
     "run_at",
     "cron_expression",
@@ -231,7 +227,6 @@ export async function updateJob(jobId, fields) {
 }
 
 export async function deleteJob(jobId) {
-  // ON DELETE CASCADE on job_executions.job_id takes care of execution history.
   const { rows } = await pool.query(
     `DELETE FROM http_jobs WHERE job_id = $1 RETURNING job_id`,
     [jobId]

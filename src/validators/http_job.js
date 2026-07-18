@@ -60,6 +60,8 @@ export const createJobSchema = z
     max_attempts: z.number().int().min(1).max(100).optional().default(3),
 
     backoff_seconds: z.number().int().min(0).optional().default(60),
+
+    enabled: z.boolean().optional().default(true),
   })
   .superRefine((data, ctx) => {
     const authResult = authConfigSchema.safeParse({
@@ -130,6 +132,7 @@ export const updateJobSchema = z
     cron_expression: z.string().optional(),
     max_attempts: z.number().int().min(1).max(100).optional(),
     backoff_seconds: z.number().int().min(0).optional(),
+    enabled: z.boolean().optional(),
   })
   .strict()
   .refine((data) => Object.keys(data).length > 0, {
@@ -168,7 +171,11 @@ export const updateJobSchema = z
   });
 
 export const listJobsQuerySchema = z.object({
-  status: z.enum(["PENDING", "RUNNING", "RETRYING", "COMPLETED", "FAILED"]).optional(),
+  // COMPLETED/FAILED reflect the job's most recent execution outcome, not
+  // a scheduling state - there's no PENDING/RUNNING column anymore, use
+  // `enabled` for pause/active filtering instead.
+  status: z.enum(["COMPLETED", "FAILED"]).optional(),
+  enabled: z.coerce.boolean().optional(),
   schedule_type: z.enum(["ONCE", "CRON"]).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
   offset: z.coerce.number().int().min(0).optional().default(0),

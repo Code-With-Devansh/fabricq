@@ -1,0 +1,2 @@
+ALTER TABLE http_jobs
+ALTER COLUMN next_run DROP NOT NULL;

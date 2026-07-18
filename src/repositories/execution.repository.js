@@ -33,7 +33,7 @@ export async function completeExecution(
          finished_at = now(),
          response_status = $3,
          response = $4,
-         error = $5
+         error = $5,
          worker_id = $6
      WHERE execution_id = $1
      RETURNING *`,

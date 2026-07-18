@@ -13,7 +13,6 @@ export const createJobService = async(data)=>{
     }
     data.next_run = next_run;
     data.attempts = 0;
-    data.status = "PENDING"
     return await createJob(data);
 }
 import { CronExpressionParser as CronParser2 } from "cron-parser";
@@ -29,8 +28,8 @@ import {
 } from "../repositories/execution.repository.js";
 import { AppError } from "../Error/appError.js";
 
-export const getJobsService = async ({ status, schedule_type, limit, offset }) => {
-  return listJobs({ status, scheduleType: schedule_type, limit, offset });
+export const getJobsService = async ({ status, enabled, schedule_type, limit, offset }) => {
+  return listJobs({ status, enabled, scheduleType: schedule_type, limit, offset });
 };
 
 export const getJobByIdService = async (jobId) => {
