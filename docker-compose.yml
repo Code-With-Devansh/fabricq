@@ -85,6 +85,24 @@ services:
     command: node src/worker-process.js
     stop_grace_period: 160s
 
+  retry-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fabricq-retry-scheduler
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    command: node src/retry_scheduler_process.js
+    stop_grace_period: 20s
+
 volumes:
   postgres_data:
   redis_data:

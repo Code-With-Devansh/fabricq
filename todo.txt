@@ -1,17 +1,19 @@
 1. user can queue job that has already been expired
-2. [done] due testing, execution table contains the column worker id that is not being populated.
 
 
-3. dont just reattempt the jobs just mark the job as failed in redis then a retry scheduler will retry it based on configured retry method.Record that a redirect occurred.
+3. dont just reattempt the jobs just mark the job as failed in redis then a retry scheduler will retry it based on configured retry method.
+
+4. Record that a redirect occurred.
 Store the Location header.
 Enforce a maximum redirect count.
 Decide which redirect status codes to follow.
 Prevent infinite redirect loops.
 
 You can then implement your own redirect logic instead of relying on fetch's automatic behavior.
+If you're implementing an HTTP job scheduler, redirect: "manual" is often preferable
 
 
-4. If you're implementing an HTTP job scheduler, redirect: "manual" is often preferable
+
 2. make watchdog and reapers
 
 3. Execution lease → determines whether a specific job can be recovered. the job lock type  ref : https://pixel-mart.in/1s07K

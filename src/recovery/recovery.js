@@ -8,7 +8,8 @@ import {
   completeExecution,
   getExecutionById,
 } from "../repositories/execution.repository.js";
-import { finalizeJobRun } from "../repositories/httpJob.repository.js";
+import { finalizeJobRun, markJobFailedAwaitingRetry } from "../repositories/httpJob.repository.js";
+import { RETRY_INTAKE_KEY } from "../retry/retry.js";
 
 // Same value the worker uses to decide an execution has gone dark (worker.js
 // heartbeats every 10s). Give it a couple of missed beats of slack before
@@ -102,21 +103,15 @@ async function findInProcessingListsFallback(executionId) {
   return null;
 }
 
-// Requeues a non-recurring job for another attempt after backoff. Mirrors
+// Marks a non-recurring job as failed-awaiting-retry after a crash. Mirrors
 // the retry branch in worker.js's handleExecution so a crash and a clean
-// failure end up in the same place. Clearing locked_at here matters more
-// than in the clean-failure path: the dead worker never released it, so
-// without this the job would just sit until the 1-minute lease expiry.
+// failure end up in the same place: attempts recorded, next_run left NULL,
+// and the retry scheduler notified via Redis intake. Clearing locked_at
+// here matters more than in the clean-failure path: the dead worker never
+// released it, so without this the job would just sit until the 1-minute
+// lease expiry.
 async function rescheduleForRetry(client, jobId) {
-  await client.query(
-    `UPDATE http_jobs
-     SET attempts = attempts + 1,
-         next_run = now() + (backoff_seconds || ' seconds')::interval,
-         locked_at = NULL,
-         updated_at = now()
-     WHERE job_id = $1`,
-    [jobId],
-  );
+  await markJobFailedAwaitingRetry(client, jobId);
 }
 
 // Handles a single stale execution: decide whether the worker actually
@@ -190,9 +185,11 @@ async function recoverExecution(executionId) {
       // Same off-by-one fix as worker.js: count this attempt before
       // deciding whether retries are exhausted, so finalizeJobRun's +1
       // never pushes attempts past max_attempts.
-      const exhaustedRetries = job.attempts + 1 >= job.max_attempts;
+      const nextAttempt = job.attempts + 1;
+      const exhaustedRetries = nextAttempt >= job.max_attempts;
+      const willRetry = !isRecurring && !exhaustedRetries;
 
-      if (!isRecurring && !exhaustedRetries) {
+      if (willRetry) {
         await rescheduleForRetry(client, job.job_id);
       } else {
         await finalizeJobRun(client, job.job_id, {
@@ -201,6 +198,13 @@ async function recoverExecution(executionId) {
       }
 
       await client.query("COMMIT");
+
+      if (willRetry) {
+        await redis.lpush(
+          RETRY_INTAKE_KEY,
+          JSON.stringify({ jobId: job.job_id, attempt: nextAttempt }),
+        );
+      }
     } catch (err) {
       await client.query("ROLLBACK");
       logger.error({ err, executionId, jobId: job.job_id }, "[recovery] failed to recover abandoned execution, leaving in place for next cycle");

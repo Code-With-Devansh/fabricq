@@ -20,7 +20,10 @@ export async function createJob(job) {
       auth_type,
       auth_config,
       redirect_mode,
-      timeout_ms
+      timeout_ms,
+      retry_strategy,
+      retry_multiplier,
+      retry_max_seconds
     )
     VALUES (
       $1,
@@ -40,7 +43,10 @@ export async function createJob(job) {
       $15,
       $16,
       $17,
-      $18
+      $18,
+      $19,
+      $20,
+      $21
  )
     RETURNING *;
   `;
@@ -64,6 +70,9 @@ export async function createJob(job) {
     job.auth_config ?? {},
     job.redirect_mode ?? "follow",
     job.timeout_ms ?? 30000,
+    job.retry_strategy ?? "FIXED",
+    job.retry_multiplier ?? 2,
+    job.retry_max_seconds ?? 3600,
   ];
 
   const { rows } = await pool.query(query, values);
@@ -104,6 +113,23 @@ export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) 
   }
 }
  
+// ONCE job failed but has retries left: worker/recovery no longer compute
+// the backoff delay themselves. This just records the attempt and leaves
+// next_run NULL - the retry scheduler is the only thing that turns it back
+// into a real timestamp (see src/retry/retry.js), based on the job's
+// configurable retry_strategy.
+export async function markJobFailedAwaitingRetry(client, jobId) {
+  await client.query(
+    `UPDATE http_jobs
+     SET attempts = attempts + 1,
+         next_run = NULL,
+         locked_at = NULL,
+         updated_at = now()
+     WHERE job_id = $1`,
+    [jobId],
+  );
+}
+
 export async function finalizeJobRun(client, jobId, { isRecurring }) {
   if (isRecurring) {
     await client.query(
@@ -202,6 +228,9 @@ export async function updateJob(jobId, fields) {
     "auth_config",
     "redirect_mode",
     "timeout_ms",
+    "retry_strategy",
+    "retry_multiplier",
+    "retry_max_seconds",
   ];
 
   const sets = [];

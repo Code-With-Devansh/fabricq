@@ -120,6 +120,26 @@ services:
       REDIS_URL: redis://redis:6379
     command: sh -c "npm install && npx nodemon --legacy-watch src/recovery_process.js"
     stop_grace_period: 116s
+  retry-scheduler:
+    build:
+      context: .
+      dockerfile: dockerfile.dev
+    container_name: fabricq-retry-scheduler
+
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/usr/src/app
+      - node_modules:/usr/src/app/node_modules
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://redis:6379
+    command: sh -c "npm install && npx nodemon --legacy-watch src/retry_scheduler_process.js"
+    stop_grace_period: 20s
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: pgadmin

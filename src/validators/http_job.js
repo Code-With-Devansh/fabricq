@@ -61,6 +61,15 @@ export const createJobSchema = z
 
     backoff_seconds: z.number().int().min(0).optional().default(60),
 
+    retry_strategy: z
+      .enum(["IMMEDIATE", "FIXED", "LINEAR", "EXPONENTIAL", "EXPONENTIAL_JITTER", "FIBONACCI"])
+      .optional()
+      .default("FIXED"),
+
+    retry_multiplier: z.number().positive().optional().default(2),
+
+    retry_max_seconds: z.number().int().min(0).optional().default(3600),
+
     enabled: z.boolean().optional().default(true),
   })
   .superRefine((data, ctx) => {
@@ -132,6 +141,11 @@ export const updateJobSchema = z
     cron_expression: z.string().optional(),
     max_attempts: z.number().int().min(1).max(100).optional(),
     backoff_seconds: z.number().int().min(0).optional(),
+    retry_strategy: z
+      .enum(["IMMEDIATE", "FIXED", "LINEAR", "EXPONENTIAL", "EXPONENTIAL_JITTER", "FIBONACCI"])
+      .optional(),
+    retry_multiplier: z.number().positive().optional(),
+    retry_max_seconds: z.number().int().min(0).optional(),
     enabled: z.boolean().optional(),
   })
   .strict()

@@ -10,7 +10,8 @@
     "start": "docker compose up --build",
     "scheduler": "node src/scheduler_process.js",
     "worker": "node src/worker_process.js",
-    "recovery": "node src/recovery_process.js"
+    "recovery": "node src/recovery_process.js",
+    "retry-scheduler": "node src/retry_scheduler_process.js"
   },
   "keywords": [],
   "author": "",

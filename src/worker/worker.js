@@ -10,7 +10,9 @@ import {
 import {
   finalizeJobRun,
   getJobById,
+  markJobFailedAwaitingRetry,
 } from "../repositories/httpJob.repository.js";
+import { RETRY_INTAKE_KEY } from "../retry/retry.js";
 
 const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
@@ -145,24 +147,19 @@ async function handleExecution(job) {
 
 
     const isRecurring = job.schedule_type === "CRON";
-    const exhaustedRetries = job.attempts + 1 >= job.max_attempts;
+    const nextAttempt = job.attempts + 1;
+    const exhaustedRetries = nextAttempt >= job.max_attempts;
 
     if (result.success) {
       await finalizeJobRun(client, job.job_id, {
         isRecurring,
       });
     } else if (!isRecurring && !exhaustedRetries) {
-      // ONCE job that failed but has retries left: reschedule after backoff.
-
-      await client.query(
-        `UPDATE http_jobs
-         SET attempts = attempts + 1,
-             next_run = now() + (backoff_seconds || ' seconds')::interval,
-             locked_at = NULL,
-             updated_at = now()
-         WHERE job_id = $1`,
-        [job.job_id],
-      );
+      // ONCE job that failed but has retries left: worker's job ends here.
+      // It does NOT compute a backoff delay - it just marks the attempt and
+      // leaves next_run NULL, then hands off to the retry scheduler, which
+      // owns all backoff-policy logic (see src/retry/retry.js).
+      await markJobFailedAwaitingRetry(client, job.job_id);
     } else {
       await finalizeJobRun(client, job.job_id, {
         isRecurring,
@@ -170,6 +167,13 @@ async function handleExecution(job) {
     }
 
     await client.query("COMMIT");
+
+    if (!result.success && !isRecurring && !exhaustedRetries) {
+      await redis.lpush(
+        RETRY_INTAKE_KEY,
+        JSON.stringify({ jobId: job.job_id, attempt: nextAttempt }),
+      );
+    }
   } catch (err) {
     await client.query("ROLLBACK");
     logger.error(
