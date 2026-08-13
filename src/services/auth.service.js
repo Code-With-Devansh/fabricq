@@ -6,7 +6,6 @@ import { hashPassword, verifyPassword } from "../utils/password.js";
 import { signAccessToken } from "../utils/jwt.js";
 import { generateRefreshToken, hashToken } from "../utils/tokens.js";
 import {
-  createAccount,
   createUser,
   findUserByEmail,
   findUserById,
@@ -16,6 +15,9 @@ import {
   revokeRefreshToken,
   revokeAllRefreshTokensForUser,
 } from "../repositories/auth.repository.js";
+import { createTeam } from "../repositories/team.repository.js";
+import { createMembership } from "../repositories/membership.repository.js";
+import { SYSTEM_ROLE } from "../repositories/role.repository.js";
 
 const REFRESH_TTL_MS = config.auth.refreshTokenTtlSeconds * 1000;
 
@@ -26,8 +28,11 @@ const REFRESH_TTL_MS = config.auth.refreshTokenTtlSeconds * 1000;
 const INVALID_CREDENTIALS = "Invalid email or password";
 const INVALID_REFRESH = "Invalid or expired refresh token";
 
-async function issueTokenPair({ userId, accountId, role }) {
-  const accessToken = await signAccessToken({ userId, accountId, role });
+// Identity-only now - no account_id/role. A user's role is per-team
+// (team_memberships), resolved per-request by loadTeamContext, not
+// baked into the token. See utils/jwt.js.
+async function issueTokenPair({ userId }) {
+  const accessToken = await signAccessToken({ userId });
   const { raw: refreshToken, hash: refreshTokenHash } = generateRefreshToken();
   return { accessToken, refreshToken, refreshTokenHash };
 }
@@ -39,35 +44,32 @@ function buildAuthResponse({ accessToken, user }) {
     expires_in: config.auth.accessTokenTtlSeconds,
     user: {
       id: user.id,
-      account_id: user.account_id,
       email: user.email,
-      role: user.role,
     },
   };
 }
 
 /**
- * Creates a brand-new account + owner user, then logs them straight in.
+ * Creates a brand-new team + the signing-up user as its OWNER, then logs
+ * them straight in. A user created this way has exactly one membership;
+ * they can be invited into further teams later (phase 1.9).
  */
-export async function signupService({ accountName, email, password }) {
+export async function signupService({ teamName, email, password }) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const account = await createAccount(client, { name: accountName });
     const passwordHash = await hashPassword(password);
-    const user = await createUser(client, {
-      accountId: account.id,
-      email,
-      passwordHash,
-      role: "owner",
+    const user = await createUser(client, { email, passwordHash });
+    const team = await createTeam(client, { name: teamName });
+    await createMembership(client, {
+      teamId: team.id,
+      userId: user.id,
+      roleId: SYSTEM_ROLE.OWNER,
     });
 
-    const { accessToken, refreshToken, refreshTokenHash } = await issueTokenPair({
-      userId: user.id,
-      accountId: user.account_id,
-      role: user.role,
-    });
+    const { accessToken, refreshToken, refreshTokenHash } =
+      await issueTokenPair({ userId: user.id });
 
     await insertRefreshToken(client, {
       userId: user.id,
@@ -77,7 +79,11 @@ export async function signupService({ accountName, email, password }) {
 
     await client.query("COMMIT");
 
-    return { ...buildAuthResponse({ accessToken, user }), refreshToken };
+    return {
+      ...buildAuthResponse({ accessToken, user }),
+      team: { id: team.id, name: team.name, role: "OWNER" },
+      refreshToken,
+    };
   } catch (err) {
     await client.query("ROLLBACK");
     // Unique violation on email is translated by the central pg error
@@ -102,11 +108,8 @@ export async function loginService({ email, password, userAgent, ip }) {
     throw new AppError(INVALID_CREDENTIALS, 401);
   }
 
-  const { accessToken, refreshToken, refreshTokenHash } = await issueTokenPair({
-    userId: user.id,
-    accountId: user.account_id,
-    role: user.role,
-  });
+  const { accessToken, refreshToken, refreshTokenHash } =
+    await issueTokenPair({ userId: user.id });
 
   const client = await pool.connect();
   try {
@@ -161,12 +164,8 @@ export async function refreshService({ refreshToken, userAgent, ip }) {
     throw new AppError(INVALID_REFRESH, 401);
   }
 
-  const { accessToken, refreshToken: newRefreshToken, refreshTokenHash } = await
-    issueTokenPair({
-      userId: user.id,
-      accountId: user.account_id,
-      role: user.role,
-    });
+  const { accessToken, refreshToken: newRefreshToken, refreshTokenHash } =
+    await issueTokenPair({ userId: user.id });
 
   const client = await pool.connect();
   try {

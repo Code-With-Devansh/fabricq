@@ -22,9 +22,9 @@ export const signup = asyncHandler(async (req, res) => {
     throw new AppError("Validation failed", 400, validated.error.flatten());
   }
 
-  const { account_name, email, password } = validated.data;
+  const { team_name, email, password } = validated.data;
   const { refreshToken, ...body } = await signupService({
-    accountName: account_name,
+    teamName: team_name,
     email,
     password,
   });

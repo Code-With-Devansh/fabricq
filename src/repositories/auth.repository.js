@@ -1,33 +1,23 @@
 import { pool } from "../config/db.js";
 
-// --- accounts ---------------------------------------------------------
+// --- users ----------------------------------------------------------
+// Users no longer carry account_id/role - those moved to team_memberships
+// (see membership.repository.js), since one user can belong to several
+// teams with a different role in each.
 
-export async function createAccount(client, { name }) {
+export async function createUser(client, { email, passwordHash }) {
   const { rows } = await client.query(
-    `INSERT INTO accounts (name) VALUES ($1) RETURNING *`,
-    [name]
-  );
-  return rows[0];
-}
-
-// --- users --------------------------------------------------------------
-
-export async function createUser(
-  client,
-  { accountId, email, passwordHash, role = "owner" }
-) {
-  const { rows } = await client.query(
-    `INSERT INTO users (account_id, email, password_hash, role)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, account_id, email, role, created_at`,
-    [accountId, email, passwordHash, role]
+    `INSERT INTO users (email, password_hash)
+     VALUES ($1, $2)
+     RETURNING id, email, created_at`,
+    [email, passwordHash]
   );
   return rows[0];
 }
 
 export async function findUserByEmail(email) {
   const { rows } = await pool.query(
-    `SELECT id, account_id, email, password_hash, role, created_at
+    `SELECT id, email, password_hash, created_at
      FROM users
      WHERE email = $1`,
     [email]
@@ -37,7 +27,7 @@ export async function findUserByEmail(email) {
 
 export async function findUserById(userId) {
   const { rows } = await pool.query(
-    `SELECT id, account_id, email, role, created_at
+    `SELECT id, email, created_at
      FROM users
      WHERE id = $1`,
     [userId]

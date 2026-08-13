@@ -1,15 +1,19 @@
-import { verifyAccessToken } from "../utils/jwt.js";
+import { verifyAccessToken, isTokenExpiredError } from "../utils/jwt.js";
 import { AppError } from "../Error/appError.js";
 
 /**
  * Verifies the dashboard access token (JWT) and attaches
- * req.auth = { userId, accountId, role }.
+ * req.auth = { userId }.
  *
- * This is intentionally separate from the (phase 2) API-key middleware:
- * /jobs/* will authenticate via API key only, dashboard/account-management
- * routes authenticate via JWT only - no route accepts either.
+ * Identity only - no team_id/role. Any route that needs a role/permission
+ * check for a specific team must also run loadTeamContext, which resolves
+ * that per (team, user) via team_memberships.
+ *
+ * This stays separate from the (phase 2) API-key middleware: /jobs/* will
+ * authenticate via API key only, dashboard/team-management routes via JWT
+ * only - no route accepts either.
  */
-export function authenticateJWT(req, res, next) {
+export async function authenticateJWT(req, res, next) {
   const header = req.headers.authorization;
 
   if (!header || !header.startsWith("Bearer ")) {
@@ -19,10 +23,10 @@ export function authenticateJWT(req, res, next) {
   const token = header.slice("Bearer ".length).trim();
 
   try {
-    req.auth = verifyAccessToken(token);
+    req.auth = await verifyAccessToken(token);
     return next();
   } catch (err) {
-    if (err.name === "TokenExpiredError") {
+    if (isTokenExpiredError(err)) {
       return next(new AppError("Access token expired", 401));
     }
     return next(new AppError("Invalid access token", 401));
