@@ -3,8 +3,6 @@ import { AppError } from "../Error/appError.js";
 import {
   signupSchema,
   loginSchema,
-  refreshSchema,
-  logoutSchema,
 } from "../validators/auth.js";
 import {
   signupService,
@@ -12,6 +10,11 @@ import {
   refreshService,
   logoutService,
 } from "../services/auth.service.js";
+import {
+  setRefreshCookie,
+  clearRefreshCookie,
+  getRefreshCookie,
+} from "../utils/refreshCookie.js";
 
 export const signup = asyncHandler(async (req, res) => {
   const validated = signupSchema.safeParse(req.body);
@@ -20,13 +23,14 @@ export const signup = asyncHandler(async (req, res) => {
   }
 
   const { account_name, email, password } = validated.data;
-  const result = await signupService({
+  const { refreshToken, ...body } = await signupService({
     accountName: account_name,
     email,
     password,
   });
 
-  return res.status(201).json({ success: true, data: result });
+  setRefreshCookie(res, refreshToken);
+  return res.status(201).json({ success: true, data: body });
 });
 
 export const login = asyncHandler(async (req, res) => {
@@ -36,38 +40,41 @@ export const login = asyncHandler(async (req, res) => {
   }
 
   const { email, password } = validated.data;
-  const result = await loginService({
+  const { refreshToken, ...body } = await loginService({
     email,
     password,
     userAgent: req.headers["user-agent"] ?? null,
     ip: req.ip ?? null,
   });
 
-  return res.status(200).json({ success: true, data: result });
+  setRefreshCookie(res, refreshToken);
+  return res.status(200).json({ success: true, data: body });
 });
 
 export const refresh = asyncHandler(async (req, res) => {
-  const validated = refreshSchema.safeParse(req.body);
-  if (!validated.success) {
-    throw new AppError("Validation failed", 400, validated.error.flatten());
+  const incomingRefreshToken = getRefreshCookie(req);
+  if (!incomingRefreshToken) {
+    throw new AppError("Missing refresh token", 401);
   }
 
-  const result = await refreshService({
-    refreshToken: validated.data.refresh_token,
+  const { refreshToken, ...body } = await refreshService({
+    refreshToken: incomingRefreshToken,
     userAgent: req.headers["user-agent"] ?? null,
     ip: req.ip ?? null,
   });
-  return res.status(200).json({ success: true, data: result });
+
+  setRefreshCookie(res, refreshToken);
+  return res.status(200).json({ success: true, data: body });
 });
 
 export const logout = asyncHandler(async (req, res) => {
-  const validated = logoutSchema.safeParse(req.body);
-  if (!validated.success) {
-    throw new AppError("Validation failed", 400, validated.error.flatten());
+  const incomingRefreshToken = getRefreshCookie(req);
+
+  if (incomingRefreshToken) {
+    await logoutService({ refreshToken: incomingRefreshToken });
   }
 
-  await logoutService({ refreshToken: validated.data.refresh_token });
-
+  clearRefreshCookie(res);
   return res.status(204).send();
 });
 

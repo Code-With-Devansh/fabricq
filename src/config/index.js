@@ -29,5 +29,19 @@ export default {
       timeCost: Number(process.env.ARGON2_TIME_COST) || 2,
       parallelism: Number(process.env.ARGON2_PARALLELISM) || 1,
     },
+    refreshCookie: {
+      name: process.env.REFRESH_COOKIE_NAME || "fq_refresh",
+      // Scoped to /auth so the cookie isn't attached to every request
+      // (e.g. /jobs, /health) - only refresh/logout need to see it.
+      path: "/auth",
+      // "none" is required for cross-origin dashboard <-> API deployments
+      // (mirrors the Snip dual-token pattern); requires secure: true.
+      sameSite: process.env.REFRESH_COOKIE_SAMESITE || "none",
+      secure: process.env.NODE_ENV === "production",
+    },
   },
+  // Dashboard origin allowed to send credentialed (cookie-bearing)
+  // requests. Wildcard CORS is incompatible with cookies, so this must
+  // be an explicit origin in production.
+  dashboardOrigin: process.env.DASHBOARD_ORIGIN || "http://localhost:5173",
 };

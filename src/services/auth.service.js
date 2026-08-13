@@ -32,10 +32,9 @@ async function issueTokenPair({ userId, accountId, role }) {
   return { accessToken, refreshToken, refreshTokenHash };
 }
 
-function buildAuthResponse({ accessToken, refreshToken, user }) {
+function buildAuthResponse({ accessToken, user }) {
   return {
     access_token: accessToken,
-    refresh_token: refreshToken,
     token_type: "Bearer",
     expires_in: config.auth.accessTokenTtlSeconds,
     user: {
@@ -78,7 +77,7 @@ export async function signupService({ accountName, email, password }) {
 
     await client.query("COMMIT");
 
-    return buildAuthResponse({ accessToken, refreshToken, user });
+    return { ...buildAuthResponse({ accessToken, user }), refreshToken };
   } catch (err) {
     await client.query("ROLLBACK");
     // Unique violation on email is translated by the central pg error
@@ -127,7 +126,7 @@ export async function loginService({ email, password, userAgent, ip }) {
     client.release();
   }
 
-  return buildAuthResponse({ accessToken, refreshToken, user });
+  return { ...buildAuthResponse({ accessToken, user }), refreshToken };
 }
 
 /**
@@ -194,11 +193,10 @@ export async function refreshService({ refreshToken, userAgent, ip }) {
     client.release();
   }
 
-  return buildAuthResponse({
-    accessToken,
+  return {
+    ...buildAuthResponse({ accessToken, user }),
     refreshToken: newRefreshToken,
-    user,
-  });
+  };
 }
 
 export async function logoutService({ refreshToken }) {
