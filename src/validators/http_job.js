@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { redirectPolicySchema } from "./redirect_policy.js";
 
 const authConfigSchema = z.discriminatedUnion("auth_type", [
   z.object({ auth_type: z.literal("NONE") }),
@@ -25,13 +26,7 @@ const authConfigSchema = z.discriminatedUnion("auth_type", [
 
 export const createJobSchema = z
   .object({
-    method: z.enum([
-      "GET",
-      "POST",
-      "PUT",
-      "PATCH",
-      "DELETE",
-    ]),
+    method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
 
     url: z.string().url(),
 
@@ -43,11 +38,19 @@ export const createJobSchema = z
 
     query_params: z.record(z.string(), z.string()).optional().default({}),
 
-    auth_type: z.enum(["NONE", "BEARER", "BASIC", "API_KEY"]).optional().default("NONE"),
+    auth_type: z
+      .enum(["NONE", "BEARER", "BASIC", "API_KEY"])
+      .optional()
+      .default("NONE"),
 
     auth_config: z.record(z.string(), z.any()).optional().default({}),
 
-    redirect_mode: z.enum(["follow", "manual", "error"]).optional().default("follow"),
+    redirect_mode: z
+      .enum(["follow", "manual", "error"])
+      .optional()
+      .default("follow"),
+
+    redirect_policy: redirectPolicySchema.partial().optional(),
 
     timeout_ms: z.number().int().min(1).max(120_000).optional().default(30_000),
 
@@ -62,7 +65,14 @@ export const createJobSchema = z
     backoff_seconds: z.number().int().min(0).optional().default(60),
 
     retry_strategy: z
-      .enum(["IMMEDIATE", "FIXED", "LINEAR", "EXPONENTIAL", "EXPONENTIAL_JITTER", "FIBONACCI"])
+      .enum([
+        "IMMEDIATE",
+        "FIXED",
+        "LINEAR",
+        "EXPONENTIAL",
+        "EXPONENTIAL_JITTER",
+        "FIBONACCI",
+      ])
       .optional()
       .default("FIXED"),
 
@@ -142,7 +152,14 @@ export const updateJobSchema = z
     max_attempts: z.number().int().min(1).max(100).optional(),
     backoff_seconds: z.number().int().min(0).optional(),
     retry_strategy: z
-      .enum(["IMMEDIATE", "FIXED", "LINEAR", "EXPONENTIAL", "EXPONENTIAL_JITTER", "FIBONACCI"])
+      .enum([
+        "IMMEDIATE",
+        "FIXED",
+        "LINEAR",
+        "EXPONENTIAL",
+        "EXPONENTIAL_JITTER",
+        "FIBONACCI",
+      ])
       .optional(),
     retry_multiplier: z.number().positive().optional(),
     retry_max_seconds: z.number().int().min(0).optional(),
@@ -162,7 +179,10 @@ export const updateJobSchema = z
         for (const issue of authResult.error.issues) {
           ctx.addIssue({
             ...issue,
-            path: ["auth_config", ...issue.path.filter((p) => p !== "auth_type")],
+            path: [
+              "auth_config",
+              ...issue.path.filter((p) => p !== "auth_type"),
+            ],
           });
         }
       }

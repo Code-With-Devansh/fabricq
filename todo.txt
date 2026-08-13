@@ -2,6 +2,9 @@
 
 2.One further issue matters for your job-execution system: redirect limits and loop detection are not enough to prevent SSRF. Since users control the HTTP destination, every redirect target should go through the same URL/IP validation as the initial URL, including blocking private/link-local/loopback destinations if your service is exposed to untrusted users.
 
+3. add raw body type ref: https://pixel-mart.in/1s07O
+
+
 4. Record that a redirect occurred.
 Store the Location header.
 Enforce a maximum redirect count.

@@ -23,7 +23,8 @@ export async function createJob(job) {
       timeout_ms,
       retry_strategy,
       retry_multiplier,
-      retry_max_seconds
+      retry_max_seconds,
+      redirect_policy
     )
     VALUES (
       $1,
@@ -46,7 +47,8 @@ export async function createJob(job) {
       $18,
       $19,
       $20,
-      $21
+      $21,
+      $22::jsonb
  )
     RETURNING *;
   `;
@@ -73,6 +75,13 @@ export async function createJob(job) {
     job.retry_strategy ?? "FIXED",
     job.retry_multiplier ?? 2,
     job.retry_max_seconds ?? 3600,
+    JSON.stringify(
+      job.redirect_policy ?? {
+        maxRedirects: 10,
+        allowCrossOrigin: false,
+        allowHttpDowngrade: false,
+      }
+    ),
   ];
 
   const { rows } = await pool.query(query, values);
@@ -232,6 +241,9 @@ export async function updateJob(jobId, fields) {
     "retry_strategy",
     "retry_multiplier",
     "retry_max_seconds",
+    // redirect_policy intentionally excluded from this list - it's jsonb
+    // and needs a merge (||), not a plain overwrite, so it's handled
+    // separately below.
   ];
 
   const sets = [];
@@ -241,6 +253,14 @@ export async function updateJob(jobId, fields) {
     if (!allowedColumns.includes(key)) continue;
     values.push(value);
     sets.push(`${key} = $${values.length}`);
+  }
+
+  if (fields.redirect_policy !== undefined) {
+    // Shallow merge: keys present in fields.redirect_policy overwrite,
+    // keys absent are left as-is. A caller sending { maxRedirects: 5 }
+    // alone must not blow away allowCrossOrigin/allowHttpDowngrade.
+    values.push(JSON.stringify(fields.redirect_policy));
+    sets.push(`redirect_policy = redirect_policy || $${values.length}::jsonb`);
   }
 
   if (sets.length === 0) return findJobById(jobId);

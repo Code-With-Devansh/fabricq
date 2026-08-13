@@ -19,8 +19,14 @@ const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 export const HEARTBEAT_SET_KEY = "execution:heartbeats";
 const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
 export const PROCESSING_INDEX_KEY = `${EXECUTION_QUEUE_KEY}:processing:index`;
-const MAX_REDIRECTS = 10;
+
+const DEFAULT_REDIRECT_POLICY = {
+  maxRedirects: 10,
+  allowCrossOrigin: false,
+  allowHttpDowngrade: false,
+};
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+
 function buildUrl(execution) {
   const url = new URL(execution.url);
   for (const [key, value] of Object.entries(execution.query_params ?? {})) {
@@ -86,11 +92,17 @@ async function executeHttpJob(execution) {
   const controller = new AbortController();
   const timeoutMs = execution.timeout_ms ?? DEFAULT_HTTP_TIMEOUT_MS;
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  const redirect_policy = {
+    ...DEFAULT_REDIRECT_POLICY,
+    ...(execution.redirect_policy ?? {}),
+  };
+
   const redirects = [];
   const visitedUrls = new Set();
 
   try {
-    let url = buildUrl(execution)
+    let url = buildUrl(execution);
     let method = execution.method;
     let body;
     const hasBody = !["GET", "DELETE"].includes(method);
@@ -98,24 +110,22 @@ async function executeHttpJob(execution) {
       const { payload } = buildRequestBody(execution);
       body = payload;
     }
-    while(true){
-      // Prevent redirect loops.
+
+    while (true) {
       if (visitedUrls.has(url)) {
         return {
           success: false,
           responseStatus: null,
           responseBody: null,
-
           redirectOccurred: redirects.length > 0,
           redirectCount: redirects.length,
           redirects,
-
           error: "Redirect loop detected",
         };
       }
       visitedUrls.add(url);
 
-      const headers = {
+      let headers = {
         ...buildAuthHeaders(execution),
         ...(execution.headers ?? {}),
       };
@@ -130,36 +140,77 @@ async function executeHttpJob(execution) {
 
       if (!REDIRECT_STATUS_CODES.has(res.status)) {
         const responseBody = await res.text();
-
         return {
           success: res.ok,
           responseStatus: res.status,
           responseBody: responseBody.slice(0, 10_000),
-
           redirectOccurred: redirects.length > 0,
           redirectCount: redirects.length,
           redirects,
-
           error: res.ok ? null : `HTTP ${res.status}`,
         };
       }
 
       const location = res.headers.get("location");
-      // A redirect without Location is malformed.
       if (!location) {
         return {
           success: false,
           responseStatus: res.status,
           responseBody: null,
-
           redirectOccurred: redirects.length > 0,
           redirectCount: redirects.length,
           redirects,
-
           error: `Redirect response ${res.status} missing Location header`,
         };
       }
+
       const nextUrl = new URL(location, url).href;
+
+      if (redirects.length >= redirect_policy.maxRedirects) {
+        return {
+          success: false,
+          responseStatus: res.status,
+          responseBody: null,
+          redirectOccurred: true,
+          redirectCount: redirects.length,
+          redirects,
+          error: `Maximum redirect count (${redirect_policy.maxRedirects}) exceeded`,
+        };
+      }
+
+      const previous = new URL(url);
+      const next = new URL(nextUrl);
+      const crossOrigin = previous.origin !== next.origin;
+
+      if (crossOrigin && !redirect_policy.allowCrossOrigin) {
+        return {
+          success: false,
+          responseStatus: res.status,
+          responseBody: null,
+          redirectOccurred: true,
+          redirectCount: redirects.length,
+          redirects,
+          error: `Cross-origin redirect to ${next.origin} is not allowed by this job's redirect policy`,
+        };
+      }
+
+      // --- HTTPS -> HTTP downgrade gate ---
+      if (
+        !redirect_policy.allowHttpDowngrade &&
+        previous.protocol === "https:" &&
+        next.protocol === "http:"
+      ) {
+        return {
+          success: false,
+          responseStatus: res.status,
+          responseBody: null,
+          redirectOccurred: true,
+          redirectCount: redirects.length,
+          redirects,
+          error:
+            "HTTPS to HTTP redirect is not allowed by this job's redirect policy",
+        };
+      }
 
       redirects.push({
         status: res.status,
@@ -168,33 +219,25 @@ async function executeHttpJob(execution) {
         to: nextUrl,
       });
 
-      if (redirects.length > MAX_REDIRECTS) {
-        return {
-          success: false,
-          responseStatus: res.status,
-          responseBody: null,
-
-          redirectOccurred: true,
-          redirectCount: redirects.length,
-          redirects,
-
-          error: `Maximum redirect count (${MAX_REDIRECTS}) exceeded`,
-        };
+      // Credentials are stripped on every cross-origin hop that is actually
+      // followed. `allowCrossOrigin` controls whether the redirect itself is
+      // allowed; it does not permit credentials to cross origins. This prevents
+      // Authorization/Cookie headers from being forwarded to an untrusted
+      // redirect target.
+      if (crossOrigin) {
+        const strippedHeaders = { ...headers };
+        delete strippedHeaders.Authorization;
+        delete strippedHeaders.authorization;
+        delete strippedHeaders.Cookie;
+        delete strippedHeaders.cookie;
+        headers = strippedHeaders;
       }
-      // Fetch semantics:
-      //
-      // 301/302:
-      //   POST -> GET
-      //
-      // 303:
-      //   anything except HEAD -> GET
-      //
-      // 307/308:
-      //   preserve method and body
-      if (
-        (res.status === 301 || res.status === 302) &&
-        method === "POST"
-      ) {
+
+      // Fetch redirect-following semantics:
+      // 301/302: POST -> GET
+      // 303: anything except HEAD -> GET
+      // 307/308: preserve method and body
+      if ((res.status === 301 || res.status === 302) && method === "POST") {
         method = "GET";
         body = undefined;
       } else if (res.status === 303 && method !== "HEAD") {
@@ -205,24 +248,14 @@ async function executeHttpJob(execution) {
       url = nextUrl;
     }
   } catch (err) {
-    // fetch() throws a TypeError with "unsafe redirect" language when
-    // redirect_mode is "error" and a redirect is encountered - surface
-    // that distinctly rather than lumping it into a generic message.
-    // const isRedirectError =
-    //   execution.redirect_mode === "error" &&
-    //   err instanceof TypeError &&
-    //   /redirect/i.test(err.message);
-    const isAbort =
-      err instanceof Error && err.name === "AbortError";
+    const isAbort = err instanceof Error && err.name === "AbortError";
     return {
       success: false,
       responseStatus: null,
       responseBody: null,
-
       redirectOccurred: redirects.length > 0,
       redirectCount: redirects.length,
       redirects,
-
       error: isAbort
         ? "Request timed out"
         : err instanceof Error
@@ -233,14 +266,12 @@ async function executeHttpJob(execution) {
     clearTimeout(timeout);
   }
 }
-
 async function handleExecution(job) {
   const result = await executeHttpJob(job);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await completeExecution(client, job.execution_id, result, WORKER_ID);
-
 
     const isRecurring = job.schedule_type === "CRON";
     const nextAttempt = job.attempts + 1;
@@ -267,7 +298,7 @@ async function handleExecution(job) {
     if (!result.success && !isRecurring && !exhaustedRetries) {
       await redis.lpush(
         RETRY_INTAKE_KEY,
-        JSON.stringify({ job:job, attempt: nextAttempt }),
+        JSON.stringify({ job: job, attempt: nextAttempt }),
       );
     }
   } catch (err) {
