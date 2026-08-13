@@ -97,6 +97,7 @@ async function executeHttpJob(execution) {
     ...DEFAULT_REDIRECT_POLICY,
     ...(execution.redirect_policy ?? {}),
   };
+  const redirectMode = execution.redirect_mode ?? "follow";
 
   const redirects = [];
   const visitedUrls = new Set();
@@ -150,7 +151,17 @@ async function executeHttpJob(execution) {
           error: res.ok ? null : `HTTP ${res.status}`,
         };
       }
-
+      if (redirectMode === "error") {
+        return {
+          success: false,
+          responseStatus: res.status,
+          responseBody: null,
+          redirectOccurred: true,
+          redirectCount: redirects.length,
+          redirects,
+          error: `Redirect encountered (${res.status}) but redirect_mode is "error"`,
+        };
+      }
       const location = res.headers.get("location");
       if (!location) {
         return {
@@ -165,7 +176,24 @@ async function executeHttpJob(execution) {
       }
 
       const nextUrl = new URL(location, url).href;
+      if (redirectMode === "manual") {
+        redirects.push({
+          status: res.status,
+          from: url,
+          location,
+          to: nextUrl,
+        });
 
+        return {
+          success: false,
+          responseStatus: res.status,
+          responseBody: null,
+          redirectOccurred: true,
+          redirectCount: redirects.length,
+          redirects,
+          error: null,
+        };
+      }
       if (redirects.length >= redirect_policy.maxRedirects) {
         return {
           success: false,

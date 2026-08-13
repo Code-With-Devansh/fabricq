@@ -24,7 +24,15 @@ export async function markExecutionRunning(executionId) {
 export async function completeExecution(
   client,
   executionId,
-  { success, responseStatus = null, responseBody = null, error = null },
+  {
+    success,
+    responseStatus = null,
+    responseBody = null,
+    error = null,
+    redirectOccurred = false,
+    redirectCount = 0,
+    redirects = [],
+  },
   WORKER_ID
 ) {
   const { rows } = await client.query(
@@ -34,7 +42,10 @@ export async function completeExecution(
          response_status = $3,
          response = $4,
          error = $5,
-         worker_id = $6
+         worker_id = $6,
+         redirect_occurred = $7,
+         redirect_count = $8,
+         redirects = $9::jsonb
      WHERE execution_id = $1
      RETURNING *`,
     [
@@ -43,7 +54,10 @@ export async function completeExecution(
       responseStatus,
       responseBody === null ? null : JSON.stringify({ body: responseBody }),
       error === null ? null : JSON.stringify({ message: error }),
-      WORKER_ID
+      WORKER_ID,
+      redirectOccurred,
+      redirectCount,
+      JSON.stringify(redirects),
     ]
   );
   return rows[0];

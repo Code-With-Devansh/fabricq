@@ -13,7 +13,7 @@
         "header": [],
         "body": {
           "mode": "raw",
-          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"https://pixel-mart.in/api/health\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"ONCE\",\r\n    \"run_at\": 1783784885\r\n}",
+          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"http://10.65.21.21:8080/redirectCheck/20\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"ONCE\",\r\n    \"redirect_mode\":\"manual\",\r\n    \"redirect_policy\":{\r\n        \"maxRedirects\":20\r\n    },\r\n    \"run_at\": 1783784885\r\n}",
           "options": {
             "raw": {
               "language": "json"
