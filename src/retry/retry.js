@@ -8,7 +8,7 @@ import { computeDelaySeconds } from "./backoff.js";
 // left. This process is the only thing that ever turns a NULL next_run
 // back into a real timestamp for such jobs - once it does, the existing
 // scheduler poll (next_run <= now()) picks it up exactly like any other
-// due job. No second queue/zset needed.
+// due job. 
 export const RETRY_INTAKE_KEY = "fabricq:retry:intake";
 
 // LPUSH isn't durable the way the Postgres claim pattern is - if this
@@ -19,14 +19,16 @@ export const RETRY_INTAKE_KEY = "fabricq:retry:intake";
 // its intake message had arrived normally.
 const RECONCILE_STALE_INTERVAL = "1 minute";
 
-async function scheduleRetry(jobId, attempt) {
-  const job = await findJobById(jobId);
+async function scheduleRetry(job) {
+  // const job = await findJobById(jobId);
+  console.log(job)
   if (!job) {
-    logger.warn({ jobId }, "[retry] job no longer exists, dropping intake entry");
+    logger.warn({ job }, "[retry] job no longer exists, dropping intake entry");
     return;
   }
+  const jobId = job.job_id;
   if (!job.enabled) {
-    logger.debug({ jobId }, "[retry] job disabled, skipping retry scheduling");
+    logger.debug({ job:job.job_id }, "[retry] job disabled, skipping retry scheduling");
     return;
   }
   // Nothing to do if it already has a next_run - either another intake
@@ -35,7 +37,7 @@ async function scheduleRetry(jobId, attempt) {
     return;
   }
 
-  const delaySeconds = computeDelaySeconds(job, attempt ?? job.attempts);
+  const delaySeconds = computeDelaySeconds(job,job.attempts);
 
   await pool.query(
     `UPDATE http_jobs
@@ -45,14 +47,14 @@ async function scheduleRetry(jobId, attempt) {
   );
 
   logger.info(
-    { jobId, attempt, strategy: job.retry_strategy, delaySeconds },
+    { jobId, attempt:job.attempt, strategy: job.retry_strategy, delaySeconds },
     "[retry] scheduled next attempt",
   );
 }
-
+// this keeps running. check this fn
 export async function runReconciliationSweep() {
   const { rows } = await pool.query(
-    `SELECT job_id, attempts
+    `SELECT *
      FROM http_jobs
      WHERE enabled
        AND schedule_type = 'ONCE'
@@ -71,9 +73,9 @@ export async function runReconciliationSweep() {
 
   for (const row of rows) {
     try {
-      await scheduleRetry(row.job_id, row.attempts);
+      await scheduleRetry(row, row.attempts);
     } catch (err) {
-      logger.error({ err, jobId: row.job_id }, "[retry] reconciliation failed for job");
+      logger.error({ err, jobId: row?.job_id }, "[retry] reconciliation failed for job");
     }
   }
 }
@@ -98,7 +100,7 @@ export async function runIntakeLoop() {
     }
 
     try {
-      await scheduleRetry(payload.jobId, payload.attempt);
+      await scheduleRetry(payload.job, payload.attempt);
     } catch (err) {
       logger.error({ err, payload }, "[retry] failed to schedule retry, will be caught by reconciliation sweep");
     }

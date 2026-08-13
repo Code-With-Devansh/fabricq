@@ -139,7 +139,8 @@ export async function finalizeJobRun(client, jobId, { isRecurring }) {
   } else {
     await client.query(
       `UPDATE http_jobs
-       SET attempts = attempts + 1, next_run = NULL, locked_at = NULL, updated_at = now()
+       SET attempts = attempts + 1, next_run = NULL, locked_at = NULL,
+           enabled = false, updated_at = now()
        WHERE job_id = $1`,
       [jobId]
     );

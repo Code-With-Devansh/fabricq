@@ -171,7 +171,7 @@ async function handleExecution(job) {
     if (!result.success && !isRecurring && !exhaustedRetries) {
       await redis.lpush(
         RETRY_INTAKE_KEY,
-        JSON.stringify({ jobId: job.job_id, attempt: nextAttempt }),
+        JSON.stringify({ job:job, attempt: nextAttempt }),
       );
     }
   } catch (err) {
