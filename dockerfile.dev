@@ -6,6 +6,8 @@
 # of fast rebuilds.
 FROM node:22-alpine
 WORKDIR /usr/src/app
+# argon2 needs build tools to compile/install its native binding on alpine
+RUN apk add --no-cache python3 make g++
 
 # Copying only the lockfiles first means this layer is cached and skipped
 # on every rebuild where dependencies haven't changed - only your actual

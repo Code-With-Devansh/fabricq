@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
 import config from "./config/index.js";
+import "./config/authGuard.js";
 import jobsRoute from './routes/jobs.route.js'
+import authRoute from './routes/auth.route.js'
 import {isShuttingDown} from './state/shutdown.js'
 import { errorHandler, notFoundHandler } from "./Error/errorHandler.js";
 const app = express();
@@ -17,6 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use("/auth", authRoute)
 app.use("/jobs", jobsRoute)
 
 app.get("/health", (req, res) => {

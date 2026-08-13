@@ -6,6 +6,48 @@
   },
   "item": [
     {
+      "name": "Dashboard Auth",
+      "item": [
+        {
+          "name": "signup",
+          "id": "7d5b8642-e08a-4f2a-9232-173112f61c50",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": ""
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "refresh",
+          "id": "c968abf2-2f3f-454d-aa63-53046de27e48",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": ""
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "login",
+          "id": "1e9e6000-27c1-443f-a983-ffbd9d3ca322",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": ""
+            }
+          },
+          "response": []
+        }
+      ],
+      "id": "03b08e2c-d2bf-4481-a35d-6965ee99bd32"
+    },
+    {
       "name": "create Job",
       "id": "f8c88018-3c1c-4beb-9035-8aaa755f4868",
       "request": {
