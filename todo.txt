@@ -1,6 +1,8 @@
 0. to think if a request with redirect = manual gets some redirect to mark it as failed and reschedule for retry or just keep it as is.
 0.1 all the query's that fetch some data uses limit and offset based pagination. 
 0.2 if the process crashes in the narrow window after commit but before the Redis LPUSH, that job is fully scheduled in Postgres (execution row exists, next_run cleared) but never reaches a worker. This isn't new — CRON jobs had the exact same gap before this change too, since their LPUSH also happened after commit. Nothing currently watches for "queued execution that never got heartbeated. claude fix: ref: https://pixel-mart.in/1s07R   gpt fix: ref: https://pixel-mart.in/1s07S
+still to decide to keep this line or not AND (locked_at IS NULL OR locked_at < now() - interval '1 minute')
+this problem is a precedent of problem in the codebase (retry.js's runReconciliationSweep) need to fix this one also.
 
 
 1. user can queue job that has already been expired
