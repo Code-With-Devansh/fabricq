@@ -1,6 +1,8 @@
 import express from "express";
 import { authenticateJWT } from "../middlewares/authenticateJWT.js";
 import { loadTeamContext, requirePermission } from "../middlewares/teamContext.js";
+import jobsRoute from "./jobs.route.js";
+import apiKeyRoute from "./apiKey.route.js";
 import {
   listMyTeams,
   getTeam,
@@ -67,5 +69,12 @@ router.delete(
   requirePermission("members:update"),
   deleteRole
 );
+
+// Jobs and API keys apply their own authenticateJWT + loadTeamContext
+// internally (see jobs.route.js / apiKey.route.js) so each sub-router is
+// self-contained; the public API equivalent lives separately at
+// routes/v1/jobs.route.js, authenticated by API key instead of JWT.
+router.use("/:teamId/jobs", jobsRoute);
+router.use("/:teamId/api-keys", apiKeyRoute);
 
 export default router;

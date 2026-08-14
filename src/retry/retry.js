@@ -1,7 +1,6 @@
 import redis from "../config/redis.js";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
-import { findJobById } from "../repositories/httpJob.repository.js";
 import { computeDelaySeconds } from "./backoff.js";
 
 // Worker/recovery LPUSH onto this when a ONCE job fails but has retries

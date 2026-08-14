@@ -3,6 +3,7 @@ import { pool } from "../config/db.js";
 export async function createJob(job) {
   const query = `
     INSERT INTO http_jobs (
+      team_id,
       method,
       url,
       body,
@@ -28,18 +29,18 @@ export async function createJob(job) {
     )
     VALUES (
       $1,
-      $2, 
-      $3, 
-      $4, 
+      $2,
+      $3,
+      $4,
       $5,
-      CASE WHEN $6::bigint IS NULL THEN NULL ELSE to_timestamp($6::bigint) END,
-      $7, 
-      $8,  
-      $9, 
-      $10, 
+      $6,
+      CASE WHEN $7::bigint IS NULL THEN NULL ELSE to_timestamp($7::bigint) END,
+      $8,
+      $9,
+      $10,
       $11,
-      to_timestamp($12::bigint),
-      $13,
+      $12,
+      to_timestamp($13::bigint),
       $14,
       $15,
       $16,
@@ -48,12 +49,14 @@ export async function createJob(job) {
       $19,
       $20,
       $21,
-      $22::jsonb
+      $22,
+      $23::jsonb
  )
     RETURNING *;
   `;
 
   const values = [
+    job.team_id,
     job.method,
     job.url,
     job.body ?? {},
@@ -88,6 +91,12 @@ export async function createJob(job) {
   return rows[0];
 }
 
+// --- background infra (scheduler/worker/recovery) -----------------------
+// These operate across ALL teams' jobs by design - they're internal claim/
+// execution machinery, not user-facing, so they intentionally have no
+// team_id filtering. Team scoping is purely an API/authorization concern,
+// applied only in the team-scoped functions below.
+
 export async function claimDueJobs(client, limit = 100) {
   const { rows } = await client.query(
     `
@@ -110,7 +119,7 @@ export async function claimDueJobs(client, limit = 100) {
   );
   return rows;
 }
- 
+
 export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) {
   if (isRecurring) {
     await client.query(
@@ -121,7 +130,7 @@ export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) 
     );
   }
 }
- 
+
 // ONCE job failed but has retries left: worker/recovery no longer compute
 // the backoff delay themselves. This just records the attempt and leaves
 // next_run NULL - the retry scheduler is the only thing that turns it back
@@ -155,7 +164,7 @@ export async function finalizeJobRun(client, jobId, { isRecurring }) {
     );
   }
 }
- 
+
 export async function getJobById(client, jobId) {
   const { rows } = await client.query(
     `SELECT * FROM http_jobs WHERE job_id = $1`,
@@ -164,19 +173,31 @@ export async function getJobById(client, jobId) {
   return rows[0] ?? null;
 }
 
-export async function findJobById(jobId) {
+// --- team-scoped (API-facing) --------------------------------------------
+// Every function below takes teamId and filters on it, so a caller can
+// never read/modify/delete a job belonging to a different team even if
+// they guess a valid job_id.
+
+export async function findJobByIdForTeam(teamId, jobId) {
   const { rows } = await pool.query(
-    `SELECT * FROM http_jobs WHERE job_id = $1`,
-    [jobId]
+    `SELECT * FROM http_jobs WHERE team_id = $1 AND job_id = $2`,
+    [teamId, jobId]
   );
   return rows[0] ?? null;
 }
 
 const OUTCOME_STATUSES = new Set(["COMPLETED", "FAILED"]);
 
-export async function listJobs({ status, enabled, scheduleType, limit, offset }) {
-  const conditions = [];
-  const values = [];
+export async function listJobsForTeam({
+  teamId,
+  status,
+  enabled,
+  scheduleType,
+  limit,
+  offset,
+}) {
+  const conditions = ["team_id = $1"];
+  const values = [teamId];
 
   if (status && OUTCOME_STATUSES.has(status)) {
     values.push(status === "COMPLETED" ? "success" : "failed");
@@ -198,7 +219,7 @@ export async function listJobs({ status, enabled, scheduleType, limit, offset })
     conditions.push(`schedule_type = $${values.length}`);
   }
 
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const where = `WHERE ${conditions.join(" AND ")}`;
 
   values.push(limit);
   const limitIdx = values.length;
@@ -220,7 +241,7 @@ export async function listJobs({ status, enabled, scheduleType, limit, offset })
   return { jobs: rows, total: countRows[0].count };
 }
 
-export async function updateJob(jobId, fields) {
+export async function updateJobForTeam(teamId, jobId, fields) {
   const allowedColumns = [
     "method",
     "url",
@@ -263,23 +284,27 @@ export async function updateJob(jobId, fields) {
     sets.push(`redirect_policy = redirect_policy || $${values.length}::jsonb`);
   }
 
-  if (sets.length === 0) return findJobById(jobId);
+  if (sets.length === 0) return findJobByIdForTeam(teamId, jobId);
 
+  values.push(teamId);
+  const teamIdx = values.length;
   values.push(jobId);
+  const jobIdx = values.length;
+
   const { rows } = await pool.query(
     `UPDATE http_jobs
      SET ${sets.join(", ")}, updated_at = now()
-     WHERE job_id = $${values.length}
+     WHERE team_id = $${teamIdx} AND job_id = $${jobIdx}
      RETURNING *`,
     values
   );
   return rows[0] ?? null;
 }
 
-export async function deleteJob(jobId) {
+export async function deleteJobForTeam(teamId, jobId) {
   const { rows } = await pool.query(
-    `DELETE FROM http_jobs WHERE job_id = $1 RETURNING job_id`,
-    [jobId]
+    `DELETE FROM http_jobs WHERE team_id = $1 AND job_id = $2 RETURNING job_id`,
+    [teamId, jobId]
   );
   return rows[0] ?? null;
 }

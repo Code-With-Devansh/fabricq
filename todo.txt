@@ -6,6 +6,15 @@ to think if a request with redirect = manual gets some redirect to mark it as fa
 
 3. add raw body type ref: https://pixel-mart.in/1s07O
 
+4. team invitations through email.
+
+5. Your current constraint:
+CONSTRAINT system_role_has_no_team
+    CHECK (NOT is_system OR team_id IS NULL)
+allows this invalid row:
+is_system = false
+team_id   = NULL
+
 2. make watchdog and reapers
 
 3. Execution lease → determines whether a specific job can be recovered. the job lock type  ref : https://pixel-mart.in/1s07K

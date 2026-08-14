@@ -3,9 +3,9 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import config from "./config/index.js";
 import "./config/authGuard.js";
-import jobsRoute from './routes/jobs.route.js'
 import authRoute from './routes/auth.route.js'
 import teamRoute from './routes/team.route.js'
+import v1JobsRoute from './routes/v1/jobs.route.js'
 import {isShuttingDown} from './state/shutdown.js'
 import { errorHandler, notFoundHandler } from "./Error/errorHandler.js";
 const app = express();
@@ -29,7 +29,7 @@ app.use((req, res, next) => {
 
 app.use("/auth", authRoute)
 app.use("/teams", teamRoute)
-app.use("/jobs", jobsRoute)
+app.use("/v1/jobs", v1JobsRoute)
 
 app.get("/health", (req, res) => {
   if (isShuttingDown()) {

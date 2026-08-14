@@ -72,6 +72,19 @@ export async function getExecutionById(executionId) {
   return rows[0] ?? null;
 }
 
+// Joins through http_jobs to enforce team ownership - an execution has
+// no team_id of its own (see migration 015 notes), so authorization has
+// to go through the job it belongs to.
+export async function getExecutionByIdForTeam(teamId, executionId) {
+  const { rows } = await pool.query(
+    `SELECT je.* FROM job_executions je
+     JOIN http_jobs hj ON hj.job_id = je.job_id
+     WHERE je.execution_id = $1 AND hj.team_id = $2`,
+    [executionId, teamId]
+  );
+  return rows[0] ?? null;
+}
+
 export async function getExecutionHistory(jobId, { limit = 50, offset = 0 } = {}) {
   const { rows } = await pool.query(
     `SELECT * FROM job_executions WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
