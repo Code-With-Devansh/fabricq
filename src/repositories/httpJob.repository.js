@@ -120,6 +120,13 @@ export async function claimDueJobs(client, limit = 100) {
   return rows;
 }
 
+// Clears next_run so the job can't match claimDueJobs' `next_run <= now()`
+// filter again while it's mid-flight (queued -> worker -> HTTP call ->
+// finalize). This is what makes claiming and scheduling atomic in the
+// same transaction actually matter: a ONCE job that hasn't finished yet
+// is structurally unreachable by the next poll, regardless of how long
+// execution takes or how stale locked_at looks - it's not depending on a
+// timing threshold anymore. See scheduler.js for the full rationale.
 export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) {
   if (isRecurring) {
     await client.query(
@@ -127,6 +134,13 @@ export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) 
        SET next_run = to_timestamp($2::bigint), locked_at = NULL, updated_at = now()
        WHERE job_id = $1`,
       [jobId, nextRun]
+    );
+  } else {
+    await client.query(
+      `UPDATE http_jobs
+       SET next_run = NULL, locked_at = NULL, updated_at = now()
+       WHERE job_id = $1`,
+      [jobId]
     );
   }
 }

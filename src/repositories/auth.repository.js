@@ -1,9 +1,5 @@
 import { pool } from "../config/db.js";
 
-// --- users ----------------------------------------------------------
-// Users no longer carry account_id/role - those moved to team_memberships
-// (see membership.repository.js), since one user can belong to several
-// teams with a different role in each.
 
 export async function createUser(client, { email, passwordHash }) {
   const { rows } = await client.query(
