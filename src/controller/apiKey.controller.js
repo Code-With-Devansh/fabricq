@@ -14,6 +14,8 @@ export const listApiKeys = asyncHandler(async (req, res) => {
 
 export const createApiKey = asyncHandler(async (req, res) => {
   const validated = createApiKeySchema.safeParse(req.body);
+  console.log("$$$$$$$$$$$")
+  console.log(validated)
   if (!validated.success) {
     throw new AppError("Validation failed", 400, validated.error.flatten());
   }

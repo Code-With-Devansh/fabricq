@@ -185,7 +185,7 @@ async function executeHttpJob(execution) {
         });
 
         return {
-          success: false,
+          success: true,
           responseStatus: res.status,
           responseBody: null,
           redirectOccurred: true,

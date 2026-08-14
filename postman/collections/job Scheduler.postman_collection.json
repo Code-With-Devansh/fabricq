@@ -9,7 +9,7 @@
       "name": "Dashboard Auth",
       "item": [
         {
-          "name": "signup",
+          "name": "login",
           "id": "7d5b8642-e08a-4f2a-9232-173112f61c50",
           "request": {
             "method": "GET",
@@ -33,8 +33,42 @@
           "response": []
         },
         {
-          "name": "login",
+          "name": "signup",
           "id": "1e9e6000-27c1-443f-a983-ffbd9d3ca322",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": "{\r\n    \"team_name\":\"Devansh\",\r\n    \"email\":\"devansharora29476@gmail.com\",\r\n    \"password\":\"myPassword\"\r\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{host}}/auth/signup",
+              "host": [
+                "{{host}}"
+              ],
+              "path": [
+                "auth",
+                "signup"
+              ]
+            }
+          },
+          "response": []
+        }
+      ],
+      "id": "03b08e2c-d2bf-4481-a35d-6965ee99bd32"
+    },
+    {
+      "name": "api_key",
+      "item": [
+        {
+          "name": "create",
+          "id": "79200762-dd77-4075-a4ec-be0741599146",
           "request": {
             "method": "GET",
             "header": [],
@@ -45,7 +79,7 @@
           "response": []
         }
       ],
-      "id": "03b08e2c-d2bf-4481-a35d-6965ee99bd32"
+      "id": "b8dea650-8993-436e-ae3d-595d65009857"
     },
     {
       "name": "create Job",

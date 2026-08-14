@@ -1,4 +1,3 @@
-0. to think if a request with redirect = manual gets some redirect to mark it as failed and reschedule for retry or just keep it as is.
 0.1 all the query's that fetch some data uses limit and offset based pagination. 
 0.2 if the process crashes in the narrow window after commit but before the Redis LPUSH, that job is fully scheduled in Postgres (execution row exists, next_run cleared) but never reaches a worker. This isn't new — CRON jobs had the exact same gap before this change too, since their LPUSH also happened after commit. Nothing currently watches for "queued execution that never got heartbeated. claude fix: ref: https://pixel-mart.in/1s07R   gpt fix: ref: https://pixel-mart.in/1s07S
 still to decide to keep this line or not AND (locked_at IS NULL OR locked_at < now() - interval '1 minute')
@@ -31,14 +30,7 @@ team_id   = NULL
 
 11. auth_config (bearer tokens, basic-auth passwords, API keys) is stored as plaintext JSONB. If this DB is ever read by an analyst, backup, or breached, all downstream credentials leak. Consider app-level encryption (e.g., encrypt auth_config with a KMS-managed key before insert).ref: https://pixel-mart.in/1s07P
 
-12. No auth/authz on the /jobs API at all — anyone who can reach it can create, read, update, or delete jobs. At minimum put an API key or JWT middleware in front of it before this is internet-facing. ref: https://pixel-mart.in/1s07Q
-
 13. cors() is wide open (*) — restrict to known origins if this is called from a browser-facing app.
-
-
-16. No tests (package.json's test script is a stub) and no CI. Given the amount of transactional/concurrency-sensitive logic (SKIP LOCKED, retry/backoff transitions), this is exactly the kind of code that benefits from integration tests against a real Postgres+Redis (docker-compose test stack), especially regression tests around the claim → execute → finalize state machine.
-
-17. No metrics/observability: queue depth, in-flight executions, failure rate, and job lag (scheduled vs actually started) are all things you'll want dashboards/alerts on before calling this production-grade — even basic Prometheus counters exported from the worker/scheduler would go a long way.
 
 18. Single scheduler container is fine correctness-wise (SKIP LOCKED means you could even run several), but there's no documented scale-out for it in compose the way there is for worker — worth deciding if you want scheduler redundancy or accept it as a single point of latency (not correctness, since a restart just resumes polling).
 
