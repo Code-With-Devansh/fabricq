@@ -11,7 +11,8 @@
     "scheduler": "node src/scheduler_process.js",
     "worker": "node src/worker_process.js",
     "recovery": "node src/recovery_process.js",
-    "retry-scheduler": "node src/retry_scheduler_process.js"
+    "retry-scheduler": "node src/retry_scheduler_process.js",
+    "outbox": "node src/outbox_process.js"
   },
   "keywords": [],
   "author": "",

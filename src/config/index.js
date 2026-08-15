@@ -36,7 +36,7 @@ export default {
       path: "/auth",
       // "none" is required for cross-origin dashboard <-> API deployments
       // (mirrors the Snip dual-token pattern); requires secure: true.
-      sameSite: process.env.REFRESH_COOKIE_SAMESITE || "none",
+      sameSite: process.env.REFRESH_COOKIE_SAMESITE || "lax",
       secure: process.env.NODE_ENV === "production",
     },
   },

@@ -59,6 +59,18 @@
             }
           },
           "response": []
+        },
+        {
+          "name": "me",
+          "id": "d135717f-50ff-4d52-98c8-3169444bbd2d",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": ""
+            }
+          },
+          "response": []
         }
       ],
       "id": "03b08e2c-d2bf-4481-a35d-6965ee99bd32"

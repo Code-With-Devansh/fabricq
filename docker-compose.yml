@@ -101,6 +101,23 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
     command: node src/retry_scheduler_process.js
+
+  outbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fabricq-outbox
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    command: node src/outbox_process.js
     stop_grace_period: 20s
 
 volumes:
