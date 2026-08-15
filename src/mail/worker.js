@@ -3,7 +3,12 @@ import logger from "../config/logger/index.js";
 import { createBullConnection } from "../config/bullRedis.js";
 import { MAIL_QUEUE_NAME, MAIL_JOB } from "../queues/mail.queue.js";
 import { sendEmail } from "./mailer.js";
-import { teamInvitationTemplate } from "./templates.js";
+import {
+  teamInvitationTemplate,
+  emailVerificationTemplate,
+  passwordResetTemplate,
+  twoFactorCodeTemplate,
+} from "./templates.js";
 
 async function handleJob(job) {
   switch (job.name) {
@@ -17,6 +22,30 @@ async function handleJob(job) {
         acceptUrl,
         expiresAt,
       });
+      await sendEmail({ to: toEmail, subject, html, text });
+      return;
+    }
+    case MAIL_JOB.EMAIL_VERIFICATION: {
+      const { toEmail, verifyUrl, expiresAt } = job.data;
+      const { subject, html, text } = emailVerificationTemplate({
+        verifyUrl,
+        expiresAt,
+      });
+      await sendEmail({ to: toEmail, subject, html, text });
+      return;
+    }
+    case MAIL_JOB.PASSWORD_RESET: {
+      const { toEmail, resetUrl, expiresAt } = job.data;
+      const { subject, html, text } = passwordResetTemplate({
+        resetUrl,
+        expiresAt,
+      });
+      await sendEmail({ to: toEmail, subject, html, text });
+      return;
+    }
+    case MAIL_JOB.TWO_FACTOR_CODE: {
+      const { toEmail, code, expiresAt } = job.data;
+      const { subject, html, text } = twoFactorCodeTemplate({ code, expiresAt });
       await sendEmail({ to: toEmail, subject, html, text });
       return;
     }

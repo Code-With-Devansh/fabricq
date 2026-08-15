@@ -23,6 +23,13 @@ export default {
       Number(process.env.REFRESH_TOKEN_TTL_SECONDS) || 60 * 60 * 24 * 7, // 7 days
     inviteTokenTtlSeconds:
       Number(process.env.INVITE_TOKEN_TTL_SECONDS) || 60 * 60 * 24 * 7, // 7 days
+    emailVerificationTtlSeconds:
+      Number(process.env.EMAIL_VERIFICATION_TTL_SECONDS) || 60 * 60 * 24, // 24h
+    passwordResetTtlSeconds:
+      Number(process.env.PASSWORD_RESET_TTL_SECONDS) || 60 * 60, // 1h
+    twoFactorCodeTtlSeconds:
+      Number(process.env.TWO_FACTOR_CODE_TTL_SECONDS) || 60 * 10, // 10 min
+    twoFactorMaxAttempts: Number(process.env.TWO_FACTOR_MAX_ATTEMPTS) || 5,
     issuer: process.env.JWT_ISSUER || "fabricq",
     audience: process.env.JWT_AUDIENCE || "fabricq-dashboard",
     argon2: {
