@@ -1,6 +1,8 @@
 import { pool } from "../config/db.js";
 import { AppError } from "../Error/appError.js";
+import config from "../config/index.js";
 import {
+  createTeam as createTeamRow,
   findTeamById,
   updateTeamName,
   deleteTeam as deleteTeamRow,
@@ -12,6 +14,7 @@ import {
   countOwners,
   updateMembershipRole,
   deleteMembership,
+  createMembership,
 } from "../repositories/membership.repository.js";
 import {
   SYSTEM_ROLE,
@@ -21,7 +24,18 @@ import {
   createCustomRole as createCustomRoleRow,
   deleteCustomRole as deleteCustomRoleRow,
 } from "../repositories/role.repository.js";
+import {
+  createInvitation,
+  revokePendingInvitationForEmail,
+  findInvitationById,
+  findInvitationByTokenHash,
+  listPendingInvitationsForTeam,
+  markInvitationAccepted,
+  revokeInvitation as revokeInvitationRow,
+} from "../repositories/invitation.repository.js";
 import { canManageMembership } from "../utils/roleHierarchy.js";
+import { generateInviteToken, hashToken } from "../utils/tokens.js";
+import { findUserById } from "../repositories/auth.repository.js";
 
 export async function listMyTeamsService(userId) {
   const rows = await listTeamsForUser(userId);
@@ -31,6 +45,31 @@ export async function listMyTeamsService(userId) {
     created_at: r.created_at,
     role: r.role_name,
   }));
+}
+
+/**
+ * A logged-in user creating an additional team (distinct from signup,
+ * which creates a user's first team). Same shape as the signup path:
+ * new team + caller as its OWNER, in one transaction.
+ */
+export async function createTeamService({ userId, name }) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const team = await createTeamRow(client, { name });
+    await createMembership(client, {
+      teamId: team.id,
+      userId,
+      roleId: SYSTEM_ROLE.OWNER,
+    });
+    await client.query("COMMIT");
+    return { ...team, role: "OWNER" };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function getTeamService(teamId) {
@@ -234,6 +273,182 @@ export async function deleteCustomRoleService({ teamId, roleId }) {
     await client.query("BEGIN");
     await deleteCustomRoleRow(client, { teamId, roleId });
     await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// --- invitations -----------------------------------------------------
+
+/**
+ * Creates (or replaces) a pending invitation for `email` on `teamId`.
+ * The raw token is returned to the caller exactly once - only its hash
+ * is persisted - so the caller (controller) is responsible for putting
+ * it in front of the invited person (accept link, email, etc).
+ *
+ * No mailer is wired up yet - this returns the raw token/link so the
+ * frontend can display or copy it. Swap in an actual email send later
+ * without changing this contract.
+ */
+export async function createInvitationService({
+  teamId,
+  email,
+  roleId,
+  invitedBy,
+}) {
+  const role = await findRoleById(roleId);
+  if (!role || (role.team_id && role.team_id !== teamId)) {
+    throw new AppError("Role not found", 404);
+  }
+
+  const existingMembership = await findMembershipByEmail(teamId, email);
+  if (existingMembership) {
+    throw new AppError("This person is already a member of the team", 409);
+  }
+
+  const { raw, hash } = generateInviteToken();
+  const expiresAt = new Date(
+    Date.now() + config.auth.inviteTokenTtlSeconds * 1000
+  );
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Replace any still-pending invite to this email first - the
+    // partial unique index (team_id, email) WHERE status='pending'
+    // would otherwise reject the insert on a re-invite.
+    await revokePendingInvitationForEmail(client, { teamId, email });
+    const invitation = await createInvitation(client, {
+      teamId,
+      email,
+      roleId,
+      tokenHash: hash,
+      invitedBy,
+      expiresAt,
+    });
+    await client.query("COMMIT");
+    return { invitation, token: raw };
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function listInvitationsService(teamId) {
+  return listPendingInvitationsForTeam(teamId);
+}
+
+export async function revokeInvitationService({ teamId, invitationId }) {
+  const revoked = await withTransaction((client) =>
+    revokeInvitationRow(client, { teamId, invitationId })
+  );
+  if (!revoked) {
+    throw new AppError("Pending invitation not found", 404);
+  }
+}
+
+/**
+ * Public preview (no auth) so a frontend can show "You've been invited
+ * to join <team> as <role>" before the person logs in or signs up.
+ * Deliberately returns nothing else about the team.
+ */
+export async function previewInvitationService(token) {
+  const invitation = await findInvitationByToken(token);
+  return {
+    team_name: invitation.team_name,
+    role: invitation.role_name,
+    email: invitation.email,
+    expires_at: invitation.expires_at,
+  };
+}
+
+/**
+ * Accepting requires the caller to be logged in as the invited email -
+ * otherwise anyone who intercepts the link could join a team meant for
+ * someone else. Idempotent against double-accept via invitation.status.
+ */
+export async function acceptInvitationService({ token, userId }) {
+  const invitation = await findInvitationByToken(token);
+
+  // The access token only carries userId (see utils/jwt.js), so the
+  // invited-email check is done against the current DB row, not a
+  // claim baked into the token.
+  const user = await findUserById(userId);
+  if (!user) throw new AppError("User not found", 404);
+
+  if (invitation.email.toLowerCase() !== user.email.toLowerCase()) {
+    throw new AppError(
+      "This invitation was sent to a different email address",
+      403
+    );
+  }
+
+  const existingMembership = await findMembership(invitation.team_id, userId);
+  if (existingMembership) {
+    throw new AppError("You're already a member of this team", 409);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await createMembership(client, {
+      teamId: invitation.team_id,
+      userId,
+      roleId: invitation.role_id,
+    });
+    await markInvitationAccepted(client, {
+      invitationId: invitation.id,
+      userId,
+    });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return { teamId: invitation.team_id, teamName: invitation.team_name, role: invitation.role_name };
+}
+
+// --- invitation helpers -----------------------------------------------
+
+async function findInvitationByToken(token) {
+  const invitation = await findInvitationByTokenHash(hashToken(token));
+
+  if (!invitation) throw new AppError("Invitation not found", 404);
+  if (invitation.status === "accepted") {
+    throw new AppError("This invitation has already been accepted", 409);
+  }
+  if (invitation.status === "revoked") {
+    throw new AppError("This invitation is no longer valid", 410);
+  }
+  if (invitation.expires_at < new Date()) {
+    throw new AppError("This invitation has expired", 410);
+  }
+  return invitation;
+}
+
+// Membership-by-email is only needed here (invite-time dedupe), so it's
+// a small local helper on top of the existing member list rather than a
+// new indexed repository query.
+async function findMembershipByEmail(teamId, email) {
+  const members = await listMembersForTeam(teamId);
+  return members.find((m) => m.email.toLowerCase() === email.toLowerCase());
+}
+
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

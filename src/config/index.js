@@ -21,6 +21,8 @@ export default {
     accessTokenTtlSeconds: Number(process.env.JWT_ACCESS_TTL_SECONDS) || 300, // 5 min
     refreshTokenTtlSeconds:
       Number(process.env.REFRESH_TOKEN_TTL_SECONDS) || 60 * 60 * 24 * 7, // 7 days
+    inviteTokenTtlSeconds:
+      Number(process.env.INVITE_TOKEN_TTL_SECONDS) || 60 * 60 * 24 * 7, // 7 days
     issuer: process.env.JWT_ISSUER || "fabricq",
     audience: process.env.JWT_AUDIENCE || "fabricq-dashboard",
     argon2: {

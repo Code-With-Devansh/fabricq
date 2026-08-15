@@ -1,12 +1,16 @@
 import { asyncHandler } from "../middlewares/asyncHandler.js";
 import { AppError } from "../Error/appError.js";
 import {
+  createTeamSchema,
   updateTeamSchema,
   updateMemberRoleSchema,
   createRoleSchema,
+  createInvitationSchema,
+  acceptInvitationSchema,
 } from "../validators/team.js";
 import {
   listMyTeamsService,
+  createTeamService,
   getTeamService,
   updateTeamService,
   deleteTeamService,
@@ -17,11 +21,32 @@ import {
   listRolesService,
   createCustomRoleService,
   deleteCustomRoleService,
+  createInvitationService,
+  listInvitationsService,
+  revokeInvitationService,
+  previewInvitationService,
+  acceptInvitationService,
 } from "../services/team.service.js";
 
 export const listMyTeams = asyncHandler(async (req, res) => {
   const teams = await listMyTeamsService(req.auth.userId);
   return res.status(200).json({ success: true, data: teams });
+});
+
+// Any logged-in user can create a new team - they become its OWNER.
+// This is how a user ends up belonging to more than one team, alongside
+// accepting invitations into teams created by others.
+export const createTeam = asyncHandler(async (req, res) => {
+  const validated = createTeamSchema.safeParse(req.body);
+  if (!validated.success) {
+    throw new AppError("Validation failed", 400, validated.error.flatten());
+  }
+
+  const team = await createTeamService({
+    userId: req.auth.userId,
+    name: validated.data.name,
+  });
+  return res.status(201).json({ success: true, data: team });
 });
 
 export const getTeam = asyncHandler(async (req, res) => {
@@ -113,4 +138,70 @@ export const deleteRole = asyncHandler(async (req, res) => {
     roleId: req.params.roleId,
   });
   return res.status(204).send();
+});
+
+// --- invitations -------------------------------------------------------
+
+export const createInvitation = asyncHandler(async (req, res) => {
+  const validated = createInvitationSchema.safeParse(req.body);
+  if (!validated.success) {
+    throw new AppError("Validation failed", 400, validated.error.flatten());
+  }
+
+  const { invitation, token } = await createInvitationService({
+    teamId: req.team.teamId,
+    email: validated.data.email,
+    roleId: validated.data.role_id,
+    invitedBy: req.auth.userId,
+  });
+
+  // No mailer wired up yet: hand back the raw token/link so the caller
+  // (dashboard) can display "copy invite link" or send it themselves.
+  // Swap this for an actual email send later without touching the
+  // service layer.
+  return res.status(201).json({
+    success: true,
+    data: {
+      id: invitation.id,
+      email: invitation.email,
+      role_id: invitation.role_id,
+      expires_at: invitation.expires_at,
+      token,
+      invite_url: `${req.protocol}://${req.get("host")}/invitations/${token}`,
+    },
+  });
+});
+
+export const listInvitations = asyncHandler(async (req, res) => {
+  const invitations = await listInvitationsService(req.team.teamId);
+  return res.status(200).json({ success: true, data: invitations });
+});
+
+export const revokeInvitation = asyncHandler(async (req, res) => {
+  await revokeInvitationService({
+    teamId: req.team.teamId,
+    invitationId: req.params.invitationId,
+  });
+  return res.status(204).send();
+});
+
+// Public - no auth. Lets a frontend show who/what the invite is for
+// before the person logs in or signs up.
+export const previewInvitation = asyncHandler(async (req, res) => {
+  const preview = await previewInvitationService(req.params.token);
+  return res.status(200).json({ success: true, data: preview });
+});
+
+// Requires auth - the logged-in user's email must match the invite.
+export const acceptInvitation = asyncHandler(async (req, res) => {
+  const validated = acceptInvitationSchema.safeParse(req.body);
+  if (!validated.success) {
+    throw new AppError("Validation failed", 400, validated.error.flatten());
+  }
+
+  const result = await acceptInvitationService({
+    token: validated.data.token,
+    userId: req.auth.userId,
+  });
+  return res.status(200).json({ success: true, data: result });
 });

@@ -15,3 +15,14 @@ export function generateRefreshToken() {
 export function hashToken(raw) {
   return crypto.createHash("sha256").update(raw).digest("hex");
 }
+
+/**
+ * Invitation tokens are opaque like refresh tokens - only the hash is
+ * stored (team_invitations.token_hash), the raw value is handed back
+ * once at creation time and embedded in the accept link.
+ */
+export function generateInviteToken() {
+  const raw = crypto.randomBytes(32).toString("base64url");
+  const hash = hashToken(raw);
+  return { raw, hash };
+}

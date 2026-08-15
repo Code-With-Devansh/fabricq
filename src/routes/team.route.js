@@ -5,6 +5,7 @@ import jobsRoute from "./jobs.route.js";
 import apiKeyRoute from "./apiKey.route.js";
 import {
   listMyTeams,
+  createTeam,
   getTeam,
   updateTeam,
   deleteTeam,
@@ -15,9 +16,19 @@ import {
   listRoles,
   createRole,
   deleteRole,
+  createInvitation,
+  listInvitations,
+  revokeInvitation,
+  previewInvitation,
+  acceptInvitation,
 } from "../controller/team.controller.js";
 
 const router = express.Router();
+
+// Public - unauthenticated preview of an invite, so a frontend can show
+// "You've been invited to join <team>" before login/signup. Mounted
+// before authenticateJWT deliberately.
+router.get("/invitations/preview/:token", previewInvitation);
 
 router.use(authenticateJWT);
 
@@ -27,6 +38,14 @@ router.get("/permissions/catalog", listPermissionsCatalog);
 
 // Teams the caller belongs to (dashboard team switcher).
 router.get("/", listMyTeams);
+// Any logged-in user can spin up an additional team - they become its
+// OWNER. This is how a user ends up on more than one team, alongside
+// accepting invitations into teams other people created.
+router.post("/", createTeam);
+
+// Accepting an invite only needs the caller's identity, not membership
+// on the target team yet - so this sits outside loadTeamContext.
+router.post("/invitations/accept", acceptInvitation);
 
 const team = loadTeamContext("teamId");
 
@@ -54,6 +73,25 @@ router.delete(
   team,
   requirePermission("members:remove"),
   removeMember
+);
+
+router.get(
+  "/:teamId/invitations",
+  team,
+  requirePermission("members:invite"),
+  listInvitations
+);
+router.post(
+  "/:teamId/invitations",
+  team,
+  requirePermission("members:invite"),
+  createInvitation
+);
+router.delete(
+  "/:teamId/invitations/:invitationId",
+  team,
+  requirePermission("members:invite"),
+  revokeInvitation
 );
 
 router.get("/:teamId/roles", team, requirePermission("members:read"), listRoles);
