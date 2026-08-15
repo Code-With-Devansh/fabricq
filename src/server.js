@@ -3,6 +3,7 @@ import redis from "./config/redis.js";
 import logger from "./config/logger/index.js";
 import { setShuttingDown } from "./state/shutdown.js";
 import config from "./config/index.js";
+import { mailQueue } from "./queues/mail.queue.js";
 
 let server;
 let isShuttingDown = false;
@@ -27,7 +28,7 @@ async function gracefulShutdown(signal) {
     });
     logger.info("HTTP server closed");
 
-    await Promise.all([redis.quit()]);
+    await Promise.all([redis.quit(), mailQueue.close()]);
     logger.info("MongoDB & Redis connection closed");
 
     logger.info("Shutdown complete");

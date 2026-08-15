@@ -10,7 +10,11 @@ export const updateTeamSchema = z.object({
 
 export const createInvitationSchema = z.object({
   email: z.string().trim().toLowerCase().email(),
-  role_id: z.string().uuid(),
+  // role_id: z.string().uuid(),
+  role_id: z.string().regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    "Invalid UUID"
+  ),
 });
 
 export const acceptInvitationSchema = z.object({

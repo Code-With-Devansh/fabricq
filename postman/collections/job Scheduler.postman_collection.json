@@ -94,6 +94,61 @@
       "id": "b8dea650-8993-436e-ae3d-595d65009857"
     },
     {
+      "name": "teams",
+      "item": [
+        {
+          "name": "create",
+          "id": "a085960d-d03e-4705-bc46-3d3622b8c9d1",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMWEwMDAwOS1kOTU3LTc2ZmYtYmZmNy1kYzZiNjBiN2M2MTgiLCJpc3MiOiJmYWJyaWNxIiwiYXVkIjoiZmFicmljcS1kYXNoYm9hcmQiLCJpYXQiOjE3ODY3ODA5MTIsImV4cCI6MTc4Njc4MTIxMn0.Dbqc3PC1bsxEf1ryw9G2Oul37Z0DzJAIDPGw7Mf2x6g",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "raw",
+              "raw": "{\r\n    \"name\":\"something\"\r\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{host}}/teams",
+              "host": [
+                "{{host}}"
+              ],
+              "path": [
+                "teams"
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "accept Invite",
+          "id": "2c320c60-7ff7-45c3-8120-b42b3f2e3aad",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": ""
+            }
+          },
+          "response": []
+        }
+      ],
+      "id": "91e11267-64fb-46ca-8caf-36fe138dc82b"
+    },
+    {
       "name": "create Job",
       "id": "f8c88018-3c1c-4beb-9035-8aaa755f4868",
       "request": {

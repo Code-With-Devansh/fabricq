@@ -46,4 +46,8 @@ export default {
   // requests. Wildcard CORS is incompatible with cookies, so this must
   // be an explicit origin in production.
   dashboardOrigin: process.env.DASHBOARD_ORIGIN || "http://localhost:5173",
+  mail: {
+    resendApiKey: process.env.RESEND_API_KEY,
+    from: process.env.MAIL_FROM,
+  },
 };

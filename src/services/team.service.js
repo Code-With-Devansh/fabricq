@@ -36,6 +36,7 @@ import {
 import { canManageMembership } from "../utils/roleHierarchy.js";
 import { generateInviteToken, hashToken } from "../utils/tokens.js";
 import { findUserById } from "../repositories/auth.repository.js";
+import { enqueueInvitationEmail } from "../queues/mail.queue.js";
 
 export async function listMyTeamsService(userId) {
   const rows = await listTeamsForUser(userId);
@@ -284,14 +285,10 @@ export async function deleteCustomRoleService({ teamId, roleId }) {
 // --- invitations -----------------------------------------------------
 
 /**
- * Creates (or replaces) a pending invitation for `email` on `teamId`.
- * The raw token is returned to the caller exactly once - only its hash
- * is persisted - so the caller (controller) is responsible for putting
- * it in front of the invited person (accept link, email, etc).
- *
- * No mailer is wired up yet - this returns the raw token/link so the
- * frontend can display or copy it. Swap in an actual email send later
- * without changing this contract.
+ * Creates (or replaces) a pending invitation for `email` on `teamId`,
+ * then enqueues a BullMQ job (queue: "email") so the mail worker process
+ * sends the actual invite email via Resend. The API call returns as soon
+ * as the job is enqueued - it doesn't wait on the send itself.
  */
 export async function createInvitationService({
   teamId,
@@ -309,19 +306,26 @@ export async function createInvitationService({
     throw new AppError("This person is already a member of the team", 409);
   }
 
+  const [team, inviter] = await Promise.all([
+    findTeamById(teamId),
+    findUserById(invitedBy),
+  ]);
+  if (!team) throw new AppError("Team not found", 404);
+
   const { raw, hash } = generateInviteToken();
   const expiresAt = new Date(
     Date.now() + config.auth.inviteTokenTtlSeconds * 1000
   );
 
   const client = await pool.connect();
+  let invitation;
   try {
     await client.query("BEGIN");
     // Replace any still-pending invite to this email first - the
     // partial unique index (team_id, email) WHERE status='pending'
     // would otherwise reject the insert on a re-invite.
     await revokePendingInvitationForEmail(client, { teamId, email });
-    const invitation = await createInvitation(client, {
+    invitation = await createInvitation(client, {
       teamId,
       email,
       roleId,
@@ -330,13 +334,26 @@ export async function createInvitationService({
       expiresAt,
     });
     await client.query("COMMIT");
-    return { invitation, token: raw };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
   } finally {
     client.release();
   }
+
+  const acceptUrl = `${config.dashboardOrigin}/invitations/${raw}`;
+
+  await enqueueInvitationEmail({
+    invitationId: invitation.id,
+    teamName: team.name,
+    inviterEmail: inviter?.email ?? "A team admin",
+    roleName: role.name,
+    toEmail: invitation.email,
+    acceptUrl,
+    expiresAt: invitation.expires_at,
+  });
+
+  return { invitation, token: raw };
 }
 
 export async function listInvitationsService(teamId) {

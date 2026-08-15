@@ -119,6 +119,23 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
     command: node src/outbox_process.js
     stop_grace_period: 20s
+  mailer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fabricq-mailer
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    command: node src/mail_worker_process.js
+    stop_grace_period: 20s
 
 volumes:
   postgres_data:

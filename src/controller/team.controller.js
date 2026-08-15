@@ -148,17 +148,17 @@ export const createInvitation = asyncHandler(async (req, res) => {
     throw new AppError("Validation failed", 400, validated.error.flatten());
   }
 
-  const { invitation, token } = await createInvitationService({
+  const { invitation } = await createInvitationService({
     teamId: req.team.teamId,
     email: validated.data.email,
     roleId: validated.data.role_id,
     invitedBy: req.auth.userId,
   });
 
-  // No mailer wired up yet: hand back the raw token/link so the caller
-  // (dashboard) can display "copy invite link" or send it themselves.
-  // Swap this for an actual email send later without touching the
-  // service layer.
+  // The raw token is only used to build the accept link that was just
+  // emailed via the mail queue - it's not returned here, mirroring how
+  // refresh tokens/API keys aren't echoed back outside their one-time
+  // issuance path.
   return res.status(201).json({
     success: true,
     data: {
@@ -166,8 +166,7 @@ export const createInvitation = asyncHandler(async (req, res) => {
       email: invitation.email,
       role_id: invitation.role_id,
       expires_at: invitation.expires_at,
-      token,
-      invite_url: `${req.protocol}://${req.get("host")}/invitations/${token}`,
+      status: invitation.status,
     },
   });
 });
