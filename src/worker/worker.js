@@ -321,6 +321,7 @@ async function handleExecution(job) {
     if (result.success) {
       await finalizeJobRun(client, job.job_id, {
         isRecurring,
+        success : true
       });
     } else if (!isRecurring && !exhaustedRetries) {
       // ONCE job that failed but has retries left: worker's job ends here.
@@ -331,6 +332,7 @@ async function handleExecution(job) {
     } else {
       await finalizeJobRun(client, job.job_id, {
         isRecurring,
+        success : false
       });
     }
 

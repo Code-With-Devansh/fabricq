@@ -212,6 +212,7 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
       } else {
         await finalizeJobRun(client, job.job_id, {
           isRecurring,
+          success : false
         });
       }
 

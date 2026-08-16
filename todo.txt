@@ -1,4 +1,27 @@
 0.1 all the query's that fetch some data uses limit and offset based pagination.
+0.2 If your worker currently does:
+
+BEGIN
+UPDATE http_jobs ...
+COMMIT
+
+for only this scheduling update, you don't need an explicit transaction. worker.js line 303 const client = await pool.connect();
+
+0.3 still need to check if i has to put success = true or false here recovery.js
+await finalizeJobRun(client, job.job_id, {
+          isRecurring,
+          success = false
+        });
+
+0.4 Fix — this is probably your best ROI for API latency:
+Cache {key_hash → {teamId, scopes, revoked_at, expires_at}} in Redis with a short TTL (30-60s) keyed by prefix. On revoke/rotate, explicitly delete the cache key (you already have the repository layer to hook into).
+Batch touchLastUsed — instead of a write per request, increment a Redis counter/set last_used:{keyId} = now() and flush to Postgres on a cron (every 30-60s), the same outbox-relay pattern you already use elsewhere. Turns N writes/sec into 1 batched write every 30s.
+
+0.5 job_executions and execution_outbox unbounded growth
+
+0.6 listJobsForTeam runs the full WHERE twice (data query + separate COUNT(*)) — for large teams this doubles scan cost. Consider COUNT(*) OVER() as a window function in the single query instead of two round trips, or cap/estimate counts for large result sets.
+
+0.7 claimDueJobs polls every 10s regardless of load — fine at your current scale, but if you want sub-second scheduling latency later, consider Postgres LISTEN/NOTIFY (trigger on insert/update of next_run) to wake the scheduler immediately instead of waiting for the next tick, falling back to polling as a safety net (you already have the "poll as backstop" pattern from the outbox).
 
 1. user can queue job that has already been expired
 

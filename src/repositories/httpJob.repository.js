@@ -162,10 +162,10 @@ export async function markJobFailedAwaitingRetry(client, jobId) {
   );
 }
 
-export async function finalizeJobRun(client, jobId, { isRecurring }) {
+export async function finalizeJobRun(client, jobId, { isRecurring, success }) {
   if (isRecurring) {
     await client.query(
-      `UPDATE http_jobs SET attempts = attempts + 1, updated_at = now() WHERE job_id = $1`,
+      `UPDATE http_jobs SET ${!success?"attempts = attempts + 1,":""} updated_at = now() WHERE job_id = $1`,
       [jobId]
     );
   } else {
