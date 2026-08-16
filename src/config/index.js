@@ -16,6 +16,9 @@ export default {
     connectionTimeoutMillis:
       Number(process.env.DATABASE_CONNECT_TIMEOUT_MS) || 10_000,
   },
+  worker: {
+    concurrency: Number(process.env.WORKER_CONCURRENCY) || 20,
+  },
   auth: {
     jwtSecret: process.env.JWT_ACCESS_SECRET,
     accessTokenTtlSeconds: Number(process.env.JWT_ACCESS_TTL_SECONDS) || 300, // 5 min

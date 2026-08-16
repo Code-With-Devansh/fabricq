@@ -13,6 +13,7 @@ import {
   markJobFailedAwaitingRetry,
 } from "../repositories/httpJob.repository.js";
 import { RETRY_INTAKE_KEY } from "../retry/retry.js";
+import config from "../config/index.js";
 // NOTE: recovery.js imports HEARTBEAT_SET_KEY/PROCESSING_INDEX_KEY from this
 // module, so this is a circular import. That's fine here - recoverExecution
 // is only ever called from inside an async function body (never at module
@@ -25,6 +26,7 @@ const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 export const HEARTBEAT_SET_KEY = "execution:heartbeats";
 const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
 export const PROCESSING_INDEX_KEY = `${EXECUTION_QUEUE_KEY}:processing:index`;
+const CONCURRENCY = Math.max(1, config.worker.concurrency);
 
 const DEFAULT_REDIRECT_POLICY = {
   maxRedirects: 10,
@@ -368,21 +370,77 @@ async function clearHeartBeats(executionId) {
 }
 
 let shuttingDown = false;
-let currentExecution = null;
+// Every in-flight job's settlement promise, keyed by execution_id purely
+// for readability in logs/debugging - the Set itself is what stopWorker and
+// the main loop use to know how many/which executions are still running.
+const inFlight = new Set();
+
 export async function stopWorker() {
   shuttingDown = true;
-  if (currentExecution) {
+  if (inFlight.size > 0) {
     logger.info(
-      "[worker] shutdown requested, waiting for in-flight execution to finish",
+      { count: inFlight.size },
+      "[worker] shutdown requested, waiting for in-flight executions to finish",
     );
-    await currentExecution.catch(() => {}); // already logged inside handleExecution
+    // Each entry already catches its own errors internally (see
+    // processJob), so this never rejects - allSettled is just extra
+    // insurance against that invariant ever slipping.
+    await Promise.allSettled([...inFlight]);
   }
-  logger.info("[worker] shutdown: no in-flight execution, safe to exit");
+  logger.info("[worker] shutdown: no in-flight executions, safe to exit");
+}
+
+// Runs one job end-to-end: claim bookkeeping, heartbeat, execute, finalize
+// or hand off to recovery on failure. Deliberately swallows all errors
+// internally (never rejects) so it's safe to fire-and-forget from the pull
+// loop below without producing an unhandled rejection.
+async function processJob(job, raw) {
+  await redis.hset(
+    PROCESSING_INDEX_KEY,
+    job.execution_id,
+    JSON.stringify({ workerId: WORKER_ID, raw }),
+  );
+  await markExecutionRunning(job.execution_id);
+  await sendHeartBeat(job.execution_id);
+  const heartbeat = setInterval(() => {
+    sendHeartBeat(job.execution_id);
+  }, 10_000);
+
+  try {
+    await handleExecution(job);
+    await redis.lrem(PROCESSING_QUEUE_KEY, 1, raw);
+    clearInterval(heartbeat);
+    await clearHeartBeats(job.execution_id);
+    await redis.hdel(PROCESSING_INDEX_KEY, job.execution_id);
+  } catch (err) {
+    logger.error(
+      { err, executionId: job.execution_id },
+      "[worker] failed to finalize execution, handing off to recovery",
+    );
+    clearInterval(heartbeat);
+    await clearHeartBeats(job.execution_id);
+    try {
+      await recoverExecution(job.execution_id, { skipFreshnessCheck: true });
+    } catch (recoveryErr) {
+      logger.error(
+        { err: recoveryErr, executionId: job.execution_id },
+        "[worker] fast-path recovery also failed, leaving heartbeat-less entry for periodic recovery sweep",
+      );
+    }
+  }
 }
 
 export async function startWorker() {
-  logger.info("[worker] started, waiting for executions");
+  logger.info(
+    { concurrency: CONCURRENCY, workerId: WORKER_ID },
+    "[worker] started, waiting for executions",
+  );
+
   while (!shuttingDown) {
+    if (inFlight.size >= CONCURRENCY) {
+      await Promise.race(inFlight);
+      continue;
+    }
     const result = await redis.blmove(
       EXECUTION_QUEUE_KEY,
       PROCESSING_QUEUE_KEY,
@@ -397,50 +455,16 @@ export async function startWorker() {
         "[worker] popped a job after shutdown was requested, finishing it anyway",
       );
     }
+
     const job = JSON.parse(result);
-    await redis.hset(
-      PROCESSING_INDEX_KEY,
-      job.execution_id,
-      JSON.stringify({ workerId: WORKER_ID, raw: result }),
-    );
-    await markExecutionRunning(job.execution_id);
-    await sendHeartBeat(job.execution_id);
-    const heartbeat = setInterval(() => {
-      sendHeartBeat(job.execution_id);
-    }, 10_000);
-    currentExecution = handleExecution(job);
-    try {
-      await currentExecution;
-      // Success path only: safe to tear down all the bookkeeping ourselves.
-      await redis.lrem(PROCESSING_QUEUE_KEY, 1, result);
-      clearInterval(heartbeat);
-      await clearHeartBeats(job.execution_id);
-      await redis.hdel(PROCESSING_INDEX_KEY, job.execution_id);
-    } catch (err) {
-      logger.error(
-        { err, executionId: job.execution_id },
-        "[worker] failed to finalize execution, handing off to recovery",
-      );
-      // Deliberately do NOT lrem the processing queue or hdel the
-      // processing index here - recoverExecution needs both intact to find
-      // this execution. We DO stop heartbeating so it reads as abandoned;
-      // skipFreshnessCheck=true tells recovery not to bother re-checking
-      // that heartbeat (we're the one who owns it, and we just stopped it
-      // on purpose), so it recovers this immediately instead of waiting
-      // for the normal 30s staleness window.
-      clearInterval(heartbeat);
-      await clearHeartBeats(job.execution_id);
-      try {
-        await recoverExecution(job.execution_id, { skipFreshnessCheck: true });
-      } catch (recoveryErr) {
-        logger.error(
-          { err: recoveryErr, executionId: job.execution_id },
-          "[worker] fast-path recovery also failed, leaving heartbeat-less entry for periodic recovery sweep",
-        );
-      }
-    } finally {
-      currentExecution = null;
-    }
+    const execution = processJob(job, result).finally(() => {
+      inFlight.delete(execution);
+    });
+    inFlight.add(execution);
   }
-  logger.info("[worker] loop exited, no longer pulling new jobs");
+
+  logger.info(
+    { inFlight: inFlight.size },
+    "[worker] loop exited, no longer pulling new jobs",
+  );
 }
