@@ -85,6 +85,24 @@ services:
     command: node src/worker-process.js
     stop_grace_period: 160s
 
+  merger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fabricq-merger
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - internal
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/fabricq
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    command: node src/merger_process.js
+    stop_grace_period: 30s
+
   retry-scheduler:
     build:
       context: .

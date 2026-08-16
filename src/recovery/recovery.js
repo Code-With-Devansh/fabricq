@@ -4,12 +4,14 @@ import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import { HEARTBEAT_SET_KEY, PROCESSING_INDEX_KEY } from "../worker/worker.js";
-import {
-  completeExecution,
-  getExecutionById,
-} from "../repositories/execution.repository.js";
+import { getExecutionById } from "../repositories/execution.repository.js";
 import { finalizeJobRun, markJobFailedAwaitingRetry } from "../repositories/httpJob.repository.js";
 import { RETRY_INTAKE_KEY } from "../retry/retry.js";
+import {
+  pushExecutionEvent,
+  recordExecutionStatus,
+  getExecutionStatus,
+} from "../streams/executionResults.js";
 
 // Same value the worker uses to decide an execution has gone dark (worker.js
 // heartbeats every 10s). Give it a couple of missed beats of slack before
@@ -157,22 +159,32 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
       return;
     }
 
-    const execution = await getExecutionById(executionId);
-    if (!execution) {
-      logger.error({ executionId }, "[recovery] execution not found in postgres, dropping orphaned entry");
-      await redis.multi()
-        .lrem(entry.listKey, 1, entry.raw)
-        .zrem(HEARTBEAT_SET_KEY, executionId)
-        .hdel(PROCESSING_INDEX_KEY, executionId)
-        .exec();
-      return;
+    // Fast path first: worker's own write-behind status hash, which is
+    // written synchronously (see streams/executionResults.js) so it can't
+    // lag behind the merger's batched Postgres flush. Only fall back to
+    // Postgres if the hash entry is missing - e.g. its TTL expired, or
+    // this is a very old entry from before the merger existed.
+    let executionStatus = await getExecutionStatus(executionId);
+    if (!executionStatus) {
+      const execution = await getExecutionById(executionId);
+      if (!execution) {
+        logger.error({ executionId }, "[recovery] execution not found in postgres, dropping orphaned entry");
+        await redis.multi()
+          .lrem(entry.listKey, 1, entry.raw)
+          .zrem(HEARTBEAT_SET_KEY, executionId)
+          .hdel(PROCESSING_INDEX_KEY, executionId)
+          .exec();
+        return;
+      }
+      executionStatus = execution.status;
     }
 
-    if (execution.status === "success" || execution.status === "failed") {
-      // Worker completed the HTTP call and updated Postgres, but crashed
-      // before it could LREM the processing list / clear the heartbeat.
-      // The execution result is already correct - just tidy up Redis.
-      logger.info({ executionId, status: execution.status }, "[recovery] execution already finished, cleaning up Redis only");
+    if (executionStatus === "success" || executionStatus === "failed") {
+      // Worker completed the HTTP call and recorded its outcome, but
+      // crashed before it could LREM the processing list / clear the
+      // heartbeat. The execution result is already correct (or queued for
+      // the merger to apply) - just tidy up Redis.
+      logger.info({ executionId, status: executionStatus }, "[recovery] execution already finished, cleaning up Redis only");
       await redis.multi()
         .lrem(entry.listKey, 1, entry.raw)
         .zrem(HEARTBEAT_SET_KEY, executionId)
@@ -186,11 +198,6 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-
-      await completeExecution(client, executionId, {
-        success: false,
-        error: "Execution abandoned: worker heartbeat lost",
-      }, null);
 
       const isRecurring = job.schedule_type === "CRON";
       // Same off-by-one fix as worker.js: count this attempt before
@@ -223,6 +230,19 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
     } finally {
       client.release();
     }
+
+    // Execution-detail row, same write-behind path as worker.js: fast
+    // status recorded synchronously, heavy payload deferred to the merger.
+    await recordExecutionStatus(executionId, "failed");
+    await pushExecutionEvent({
+      executionId,
+      type: "completed",
+      payload: {
+        success: false,
+        error: "Execution abandoned: worker heartbeat lost",
+        workerId: null,
+      },
+    });
 
     await redis.multi()
       .lrem(entry.listKey, 1, entry.raw)

@@ -4,16 +4,17 @@ import logger from "../config/logger/index.js";
 import os from "os";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import {
-  markExecutionRunning,
-  completeExecution,
-} from "../repositories/execution.repository.js";
-import {
   finalizeJobRun,
   getJobById,
   markJobFailedAwaitingRetry,
 } from "../repositories/httpJob.repository.js";
 import { RETRY_INTAKE_KEY } from "../retry/retry.js";
 import config from "../config/index.js";
+import {
+  pushExecutionEvent,
+  recordExecutionStatus,
+  clearExecutionStatus,
+} from "../streams/executionResults.js";
 // NOTE: recovery.js imports HEARTBEAT_SET_KEY/PROCESSING_INDEX_KEY from this
 // module, so this is a circular import. That's fine here - recoverExecution
 // is only ever called from inside an async function body (never at module
@@ -304,10 +305,14 @@ async function executeHttpJob(execution) {
 }
 async function handleExecution(job) {
   const result = await executeHttpJob(job);
+
+  // Scheduling-critical state (attempts/next_run/enabled on http_jobs)
+  // stays on the synchronous Postgres path, driven entirely off the
+  // in-memory `result` - it never reads or waits on job_executions, so
+  // deferring the execution-detail row below can't create a race here.
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await completeExecution(client, job.execution_id, result, WORKER_ID);
 
     const isRecurring = job.schedule_type === "CRON";
     const nextAttempt = job.attempts + 1;
@@ -347,6 +352,18 @@ async function handleExecution(job) {
   } finally {
     client.release();
   }
+
+  // Execution-detail row (response body, status, redirects) is write-behind:
+  // record the outcome in Redis (fast, synchronous, cheap - used by
+  // recovery.js so it never races the merger) and hand the heavy payload
+  // off to the stream for the merger process to batch into Postgres.
+  const status = result.success ? "success" : "failed";
+  await recordExecutionStatus(job.execution_id, status);
+  await pushExecutionEvent({
+    executionId: job.execution_id,
+    type: "completed",
+    payload: { ...result, workerId: WORKER_ID },
+  });
 
   logger.info(
     {
@@ -395,23 +412,32 @@ export async function stopWorker() {
 // internally (never rejects) so it's safe to fire-and-forget from the pull
 // loop below without producing an unhandled rejection.
 async function processJob(job, raw) {
-  await redis.hset(
-    PROCESSING_INDEX_KEY,
-    job.execution_id,
-    JSON.stringify({ workerId: WORKER_ID, raw }),
-  );
-  await markExecutionRunning(job.execution_id);
-  await sendHeartBeat(job.execution_id);
+  // These three are independent of each other - run them concurrently
+  // instead of paying for three sequential round trips before work starts.
+  await Promise.all([
+    redis.hset(
+      PROCESSING_INDEX_KEY,
+      job.execution_id,
+      JSON.stringify({ workerId: WORKER_ID, raw }),
+    ),
+    recordExecutionStatus(job.execution_id, "running"),
+    pushExecutionEvent({ executionId: job.execution_id, type: "running", payload: {} }),
+    sendHeartBeat(job.execution_id),
+  ]);
   const heartbeat = setInterval(() => {
     sendHeartBeat(job.execution_id);
   }, 10_000);
 
   try {
     await handleExecution(job);
-    await redis.lrem(PROCESSING_QUEUE_KEY, 1, raw);
     clearInterval(heartbeat);
-    await clearHeartBeats(job.execution_id);
-    await redis.hdel(PROCESSING_INDEX_KEY, job.execution_id);
+    // Independent cleanup ops - pipeline instead of three sequential round trips.
+    await redis
+      .multi()
+      .lrem(PROCESSING_QUEUE_KEY, 1, raw)
+      .zrem(HEARTBEAT_SET_KEY, job.execution_id)
+      .hdel(PROCESSING_INDEX_KEY, job.execution_id)
+      .exec();
   } catch (err) {
     logger.error(
       { err, executionId: job.execution_id },

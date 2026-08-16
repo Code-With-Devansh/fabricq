@@ -64,6 +64,85 @@ export async function completeExecution(
 }
 
 
+// --- batched write-behind path (used only by the merger process) ---------
+// These replace per-execution markExecutionRunning/completeExecution calls
+// with a single multi-row statement per flush. Order within each array
+// must line up positionally - callers build these from the same list.
+
+export async function markExecutionsRunningBatch(client, executionIds) {
+  if (executionIds.length === 0) return;
+  await client.query(
+    `UPDATE job_executions je
+     SET status = 'running', started_at = now()
+     FROM (SELECT unnest($1::uuid[]) AS execution_id) x
+     WHERE je.execution_id = x.execution_id
+       AND je.status = 'queued'`, // don't clobber a later 'completed' event that flushed first
+    [executionIds]
+  );
+}
+
+export async function completeExecutionsBatch(client, rows) {
+  if (rows.length === 0) return;
+
+  const executionIds = [];
+  const statuses = [];
+  const responseStatuses = [];
+  const responses = [];
+  const errors = [];
+  const workerIds = [];
+  const redirectOccurreds = [];
+  const redirectCounts = [];
+  const redirectsArr = [];
+
+  for (const r of rows) {
+    executionIds.push(r.executionId);
+    statuses.push(r.success ? "success" : "failed");
+    responseStatuses.push(r.responseStatus ?? null);
+    responses.push(
+      r.responseBody === null || r.responseBody === undefined
+        ? null
+        : JSON.stringify({ body: r.responseBody })
+    );
+    errors.push(r.error === null || r.error === undefined ? null : JSON.stringify({ message: r.error }));
+    workerIds.push(r.workerId ?? null);
+    redirectOccurreds.push(r.redirectOccurred ?? false);
+    redirectCounts.push(r.redirectCount ?? 0);
+    redirectsArr.push(JSON.stringify(r.redirects ?? []));
+  }
+
+  await client.query(
+    `UPDATE job_executions je
+     SET status = x.status,
+         finished_at = now(),
+         response_status = x.response_status,
+         response = x.response::jsonb,
+         error = x.error::jsonb,
+         worker_id = x.worker_id,
+         redirect_occurred = x.redirect_occurred,
+         redirect_count = x.redirect_count,
+         redirects = x.redirects::jsonb
+     FROM (
+       SELECT * FROM unnest(
+         $1::uuid[], $2::execution_status[], $3::int[], $4::text[],
+         $5::text[], $6::text[], $7::boolean[], $8::int[], $9::text[]
+       ) AS t(execution_id, status, response_status, response, error,
+              worker_id, redirect_occurred, redirect_count, redirects)
+     ) x
+     WHERE je.execution_id = x.execution_id`,
+    [
+      executionIds,
+      statuses,
+      responseStatuses,
+      responses,
+      errors,
+      workerIds,
+      redirectOccurreds,
+      redirectCounts,
+      redirectsArr,
+    ]
+  );
+}
+
 export async function getExecutionById(executionId) {
   const { rows } = await pool.query(
     `SELECT * FROM job_executions WHERE execution_id = $1`,

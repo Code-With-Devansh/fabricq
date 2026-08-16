@@ -13,6 +13,7 @@
     "recovery": "node src/recovery_process.js",
     "retry-scheduler": "node src/retry_scheduler_process.js",
     "outbox": "node src/outbox_process.js",
+    "merger": "node src/merger_process.js",
     "mail-worker": "node src/mail_worker_process.js"
   },
   "keywords": [],
