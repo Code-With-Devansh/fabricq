@@ -117,7 +117,16 @@ async function rescheduleForRetry(client, jobId) {
 // Handles a single stale execution: decide whether the worker actually
 // finished before dying (nothing to do but tidy Redis) or genuinely
 // abandoned it mid-flight (fail the execution, retry/finalize the job).
-async function recoverExecution(executionId) {
+//
+// skipFreshnessCheck: set by the worker's own fast-path call (see
+// worker.js) when IT is the one telling us the execution was abandoned,
+// e.g. because handleExecution threw and it already stopped heartbeating.
+// In that case there's no heartbeat race to re-check - the worker calling
+// this function *is* the one who owns that heartbeat, so waiting for it to
+// go stale would just add latency for no additional safety. The periodic
+// sweep in runRecoveryCycle() never sets this - it always re-checks
+// freshness, since it's reacting to a heartbeat it doesn't control.
+async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}) {
   const token = await acquireLock(executionId);
   if (!token) {
     logger.debug({ executionId }, "[recovery] lock held by another recovery run, skipping");
@@ -125,12 +134,14 @@ async function recoverExecution(executionId) {
   }
 
   try {
-    // Re-check freshness now that we hold the lock - the worker may have
-    // heartbeated again between our scan and acquiring the lock.
-    const score = await redis.zscore(HEARTBEAT_SET_KEY, executionId);
-    if (score !== null && Number(score) > Date.now() - HEARTBEAT_TIMEOUT_MS) {
-      logger.debug({ executionId }, "[recovery] heartbeat is fresh again, worker is alive");
-      return;
+    if (!skipFreshnessCheck) {
+      // Re-check freshness now that we hold the lock - the worker may have
+      // heartbeated again between our scan and acquiring the lock.
+      const score = await redis.zscore(HEARTBEAT_SET_KEY, executionId);
+      if (score !== null && Number(score) > Date.now() - HEARTBEAT_TIMEOUT_MS) {
+        logger.debug({ executionId }, "[recovery] heartbeat is fresh again, worker is alive");
+        return;
+      }
     }
 
     let entry = await lookupProcessingEntry(executionId);
@@ -227,6 +238,8 @@ async function recoverExecution(executionId) {
     await releaseLock(executionId, token);
   }
 }
+
+export { recoverExecution };
 
 export async function runRecoveryCycle() {
   const staleIds = await getStaleExecutionIds();

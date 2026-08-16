@@ -13,6 +13,12 @@ import {
   markJobFailedAwaitingRetry,
 } from "../repositories/httpJob.repository.js";
 import { RETRY_INTAKE_KEY } from "../retry/retry.js";
+// NOTE: recovery.js imports HEARTBEAT_SET_KEY/PROCESSING_INDEX_KEY from this
+// module, so this is a circular import. That's fine here - recoverExecution
+// is only ever called from inside an async function body (never at module
+// load time), so by the time it actually runs both modules have finished
+// initializing.
+import { recoverExecution } from "../recovery/recovery.js";
 
 const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
@@ -402,17 +408,37 @@ export async function startWorker() {
     const heartbeat = setInterval(() => {
       sendHeartBeat(job.execution_id);
     }, 10_000);
-    currentExecution = handleExecution(job).catch((err) => {
-      logger.error({ err }, "[worker] loop error, retrying in 1s");
-      return new Promise((r) => setTimeout(r, 1000));
-    });
+    currentExecution = handleExecution(job);
     try {
       await currentExecution;
+      // Success path only: safe to tear down all the bookkeeping ourselves.
       await redis.lrem(PROCESSING_QUEUE_KEY, 1, result);
-    } finally {
       clearInterval(heartbeat);
       await clearHeartBeats(job.execution_id);
       await redis.hdel(PROCESSING_INDEX_KEY, job.execution_id);
+    } catch (err) {
+      logger.error(
+        { err, executionId: job.execution_id },
+        "[worker] failed to finalize execution, handing off to recovery",
+      );
+      // Deliberately do NOT lrem the processing queue or hdel the
+      // processing index here - recoverExecution needs both intact to find
+      // this execution. We DO stop heartbeating so it reads as abandoned;
+      // skipFreshnessCheck=true tells recovery not to bother re-checking
+      // that heartbeat (we're the one who owns it, and we just stopped it
+      // on purpose), so it recovers this immediately instead of waiting
+      // for the normal 30s staleness window.
+      clearInterval(heartbeat);
+      await clearHeartBeats(job.execution_id);
+      try {
+        await recoverExecution(job.execution_id, { skipFreshnessCheck: true });
+      } catch (recoveryErr) {
+        logger.error(
+          { err: recoveryErr, executionId: job.execution_id },
+          "[worker] fast-path recovery also failed, leaving heartbeat-less entry for periodic recovery sweep",
+        );
+      }
+    } finally {
       currentExecution = null;
     }
   }
