@@ -18,9 +18,8 @@ export const RETRY_INTAKE_KEY = "fabricq:retry:intake";
 // its intake message had arrived normally.
 const RECONCILE_STALE_INTERVAL = "1 minute";
 
-async function scheduleRetry(job) {
+async function scheduleRetry(job, attempt) {
   // const job = await findJobById(jobId);
-  console.log(job)
   if (!job) {
     logger.warn({ job }, "[retry] job no longer exists, dropping intake entry");
     return;
@@ -36,7 +35,7 @@ async function scheduleRetry(job) {
     return;
   }
 
-  const delaySeconds = computeDelaySeconds(job,job.attempts);
+  const delaySeconds = computeDelaySeconds(job,attempt);
 
   await pool.query(
     `UPDATE http_jobs
@@ -46,7 +45,7 @@ async function scheduleRetry(job) {
   );
 
   logger.info(
-    { jobId, attempt:job.attempt, strategy: job.retry_strategy, delaySeconds },
+    { jobId, attempt:attempt, strategy: job.retry_strategy, delaySeconds },
     "[retry] scheduled next attempt",
   );
 }

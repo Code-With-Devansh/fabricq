@@ -108,7 +108,7 @@ export async function claimDueJobs(client, limit = 100) {
       WHERE enabled
         AND next_run IS NOT NULL
         AND next_run <= now()
-        AND (locked_at IS NULL OR locked_at < now() - interval '1 minute')
+        AND locked_at IS NULL
       ORDER BY next_run
       LIMIT $1
       FOR UPDATE SKIP LOCKED
