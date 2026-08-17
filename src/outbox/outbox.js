@@ -16,20 +16,27 @@ import {
 const DEDUPE_TTL_SECONDS = 60 * 60;
 const PUBLISHED_SET_PREFIX = "fabricq:outbox:published:";
 
-// SADD + LPUSH atomically in one round trip so there's no window where
+// Cap on stream length - approximate trim (~) so it doesn't have to
+// examine every entry on every XADD. Generous enough to comfortably
+// outlive any realistic backlog between workers/recovery and the
+// consumer group's oldest unacked entry.
+const STREAM_MAXLEN = 100_000;
+
+// SADD + XADD atomically in one round trip so there's no window where
 // two callers (the scheduler's immediate push and a relay sweep racing
-// it) could both see "not yet marked published" and both LPUSH - one of
-// them would win the SADD, the other's LPUSH gets skipped entirely.
+// it) could both see "not yet marked published" and both XADD - one of
+// them would win the SADD, the other's XADD gets skipped entirely.
 const PUBLISH_SCRIPT = `
 local dedupeKey = KEYS[1]
 local queueKey = KEYS[2]
 local executionId = ARGV[1]
 local payload = ARGV[2]
 local ttl = tonumber(ARGV[3])
+local maxlen = ARGV[4]
 
 local added = redis.call("SET", dedupeKey, "1", "NX", "EX", ttl)
 if added then
-  redis.call("LPUSH", queueKey, payload)
+  redis.call("XADD", queueKey, "MAXLEN", "~", maxlen, "*", "payload", payload)
   return 1
 end
 return 0
@@ -57,7 +64,8 @@ async function publishOne({ executionId, queueKey, payload, dedupeKey = executio
       queueKey,
       executionId,
       JSON.stringify(payload),
-      DEDUPE_TTL_SECONDS
+      DEDUPE_TTL_SECONDS,
+      STREAM_MAXLEN
     );
     return true;
   } catch (err) {

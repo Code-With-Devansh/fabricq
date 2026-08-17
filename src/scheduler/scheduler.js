@@ -5,8 +5,27 @@ import { claimDueJobs, markJobScheduled } from "../repositories/httpJob.reposito
 import { createExecution } from "../repositories/execution.repository.js";
 import { createOutboxEntry } from "../repositories/outbox.repository.js";
 import { publishOutboxEntryNow } from "../outbox/outbox.js";
+import redis from "../config/redis.js";
 
 const EXECUTION_QUEUE_KEY = "fabricq:executions";
+// Single consumer group shared by every worker process - each worker is
+// its own consumer within it (see worker.js's WORKER_ID). Recovery also
+// reads/claims from this same group rather than maintaining a parallel
+// index, so "who owns this execution" only ever lives in one place: the
+// group's pending-entries list (PEL).
+export const EXECUTION_QUEUE_GROUP = "fabricq-workers";
+
+// Ensure the consumer group exists. Safe to call repeatedly (BUSYGROUP is
+// swallowed) - both worker.js and recovery.js call this on startup, same
+// pattern as streams/executionResults.js's ensureConsumerGroup. MKSTREAM
+// so this also creates the stream itself on a totally fresh deploy.
+export async function ensureExecutionQueueGroup() {
+  try {
+    await redis.xgroup("CREATE", EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, "$", "MKSTREAM");
+  } catch (err) {
+    if (!String(err.message).includes("BUSYGROUP")) throw err;
+  }
+}
 
 function computeNextRunEpoch(job) {
   const expr = CronExpressionParser.parse(job.cron_expression, {

@@ -2,7 +2,11 @@ import redis from "../config/redis.js";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
 import os from "os";
-import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
+import {
+  EXECUTION_QUEUE_KEY,
+  EXECUTION_QUEUE_GROUP,
+  ensureExecutionQueueGroup,
+} from "../scheduler/scheduler.js";
 import {
   disableJob,
 } from "../repositories/httpJob.repository.js";
@@ -12,18 +16,10 @@ import {
   pushExecutionEvent,
   recordExecutionStatus,
 } from "../streams/executionResults.js";
-// NOTE: recovery.js imports HEARTBEAT_SET_KEY/PROCESSING_INDEX_KEY from this
-// module, so this is a circular import. That's fine here - recoverExecution
-// is only ever called from inside an async function body (never at module
-// load time), so by the time it actually runs both modules have finished
-// initializing.
 import { recoverExecution } from "../recovery/recovery.js";
 
 const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
-export const HEARTBEAT_SET_KEY = "execution:heartbeats";
-const PROCESSING_QUEUE_KEY = `${EXECUTION_QUEUE_KEY}:processing:${WORKER_ID}`;
-export const PROCESSING_INDEX_KEY = `${EXECUTION_QUEUE_KEY}:processing:index`;
 const CONCURRENCY = Math.max(1, config.worker.concurrency);
 
 const DEFAULT_REDIRECT_POLICY = {
@@ -384,17 +380,6 @@ async function handleExecution(job) {
   );
 }
 
-async function sendHeartBeat(executionId) {
-  try {
-    await redis.zadd(HEARTBEAT_SET_KEY, Date.now(), executionId);
-  } catch (err) {
-    logger.warn({ err, executionId }, "Failed to update heartbeat");
-  }
-}
-async function clearHeartBeats(executionId) {
-  await redis.zrem(HEARTBEAT_SET_KEY, executionId);
-}
-
 let shuttingDown = false;
 // Every in-flight job's settlement promise, keyed by execution_id purely
 // for readability in logs/debugging - the Set itself is what stopWorker and
@@ -416,56 +401,54 @@ export async function stopWorker() {
   logger.info("[worker] shutdown: no in-flight executions, safe to exit");
 }
 
-// Runs one job end-to-end: claim bookkeeping, heartbeat, execute, finalize
-// or hand off to recovery on failure. Deliberately swallows all errors
-// internally (never rejects) so it's safe to fire-and-forget from the pull
-// loop below without producing an unhandled rejection.
-async function processJob(job, raw) {
-  // These three are independent of each other - run them concurrently
-  // instead of paying for three sequential round trips before work starts.
+// Runs one job end-to-end: bookkeeping, execute, finalize (XACK) or hand
+// off to recovery on failure. Deliberately swallows all errors internally
+// (never rejects) so it's safe to fire-and-forget from the pull loop below
+// without producing an unhandled rejection.
+//
+// No claim bookkeeping needed here anymore - XREADGROUP already recorded
+// this execution as owned by this consumer (WORKER_ID) in the group's
+// pending-entries list the moment it was read, atomically with the read
+// itself. There's no separate index write, and so no crash window between
+// "job popped" and "ownership recorded" for recovery to fall back on.
+async function processJob(job, streamId) {
   await Promise.all([
-    redis.hset(
-      PROCESSING_INDEX_KEY,
-      job.execution_id,
-      JSON.stringify({ workerId: WORKER_ID, raw }),
-    ),
     recordExecutionStatus(job.execution_id, "running"),
     pushExecutionEvent({ executionId: job.execution_id, type: "running", payload: {} }),
-    sendHeartBeat(job.execution_id),
   ]);
-  const heartbeat = setInterval(() => {
-    sendHeartBeat(job.execution_id);
-  }, 10_000);
 
   try {
     await handleExecution(job);
-    clearInterval(heartbeat);
-    // Independent cleanup ops - pipeline instead of three sequential round trips.
-    await redis
-      .multi()
-      .lrem(PROCESSING_QUEUE_KEY, 1, raw)
-      .zrem(HEARTBEAT_SET_KEY, job.execution_id)
-      .hdel(PROCESSING_INDEX_KEY, job.execution_id)
-      .exec();
+    await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
   } catch (err) {
     logger.error(
       { err, executionId: job.execution_id },
       "[worker] failed to finalize execution, handing off to recovery",
     );
-    clearInterval(heartbeat);
-    await clearHeartBeats(job.execution_id);
     try {
-      await recoverExecution(job.execution_id, { skipFreshnessCheck: true });
+      await recoverExecution(job.execution_id, streamId, { skipFreshnessCheck: true });
     } catch (recoveryErr) {
       logger.error(
         { err: recoveryErr, executionId: job.execution_id },
-        "[worker] fast-path recovery also failed, leaving heartbeat-less entry for periodic recovery sweep",
+        "[worker] fast-path recovery also failed, leaving entry pending for periodic recovery sweep",
       );
     }
   }
 }
 
+// Pulls the "payload" field back out of the flat field/value array
+// XREADGROUP returns (e.g. ["payload", "<json>"]) - mirrors
+// merger.js's parseEntry for the same wire shape.
+function extractPayload(fields) {
+  for (let i = 0; i < fields.length; i += 2) {
+    if (fields[i] === "payload") return fields[i + 1];
+  }
+  return null;
+}
+
 export async function startWorker() {
+  await ensureExecutionQueueGroup();
+
   logger.info(
     { concurrency: CONCURRENCY, workerId: WORKER_ID },
     "[worker] started, waiting for executions",
@@ -476,13 +459,26 @@ export async function startWorker() {
       await Promise.race(inFlight);
       continue;
     }
-    const result = await redis.blmove(
-      EXECUTION_QUEUE_KEY,
-      PROCESSING_QUEUE_KEY,
-      "RIGHT",
-      "LEFT",
-      5,
-    );
+
+    let result;
+    try {
+      result = await redis.xreadgroup(
+        "GROUP",
+        EXECUTION_QUEUE_GROUP,
+        WORKER_ID,
+        "COUNT",
+        1,
+        "BLOCK",
+        5000,
+        "STREAMS",
+        EXECUTION_QUEUE_KEY,
+        ">",
+      );
+    } catch (err) {
+      logger.error({ err }, "[worker] xreadgroup failed, backing off");
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
 
     if (!result) continue; // timed out, nothing to do
     if (shuttingDown) {
@@ -491,8 +487,17 @@ export async function startWorker() {
       );
     }
 
-    const job = JSON.parse(result);
-    const execution = processJob(job, result).finally(() => {
+    const [[, entries]] = result;
+    const [streamId, fields] = entries[0];
+    const raw = extractPayload(fields);
+    if (!raw) {
+      logger.error({ streamId }, "[worker] entry missing payload field, acking to drop it");
+      await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
+      continue;
+    }
+
+    const job = JSON.parse(raw);
+    const execution = processJob(job, streamId).finally(() => {
       inFlight.delete(execution);
     });
     inFlight.add(execution);

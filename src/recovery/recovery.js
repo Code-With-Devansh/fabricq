@@ -2,8 +2,11 @@ import crypto from "crypto";
 import redis from "../config/redis.js";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
-import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
-import { HEARTBEAT_SET_KEY, PROCESSING_INDEX_KEY } from "../worker/worker.js";
+import {
+  EXECUTION_QUEUE_KEY,
+  EXECUTION_QUEUE_GROUP,
+  ensureExecutionQueueGroup,
+} from "../scheduler/scheduler.js";
 import { getExecutionById } from "../repositories/execution.repository.js";
 import { disableJob } from "../repositories/httpJob.repository.js";
 import { scheduleExecutionRetry } from "../retry/scheduleRetry.js";
@@ -13,13 +16,26 @@ import {
   getExecutionStatus,
 } from "../streams/executionResults.js";
 
-// Same value the worker uses to decide an execution has gone dark (worker.js
-// heartbeats every 10s). Give it a couple of missed beats of slack before
-// we call it abandoned.
-const HEARTBEAT_TIMEOUT_MS = 30_000;
-const PROCESSING_KEY_PATTERN = `${EXECUTION_QUEUE_KEY}:processing:*`;
-const LOCK_PREFIX = "recovery:lock:";
-const LOCK_TTL_MS = 15_000;
+// Same value the worker uses to decide an execution has gone dark - now
+// it's purely a min-idle-time threshold for XPENDING/XCLAIM rather than a
+// separate heartbeat zset the worker had to maintain itself. An entry
+// sitting unacked in the group's PEL for longer than this, with no
+// activity, is presumed abandoned.
+const STALE_IDLE_MS = 30_000;
+const CLAIM_BATCH_SIZE = 100;
+
+// Identity this process claims entries under. Distinct from any worker's
+// WORKER_ID so a recovered entry's ownership is unambiguous in XPENDING
+// output while recovery is working on it.
+const RECOVERY_CONSUMER = `recovery:${crypto.randomUUID()}`;
+
+// Guards against a poison-pill payload (e.g. one that always throws before
+// the worker can even parse it) looping forever between "claimed by a
+// worker", "worker dies/crashes on it immediately", "reclaimed by
+// recovery", repeat. XPENDING's delivery-count tells us how many times an
+// entry has been claimed; past this many, stop retrying it as a live job
+// and just fail it outright.
+const MAX_DELIVERY_COUNT = 5;
 
 const unlockScript = `
   if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -28,6 +44,8 @@ const unlockScript = `
     return 0
   end
 `;
+const LOCK_PREFIX = "recovery:lock:";
+const LOCK_TTL_MS = 30_000;
 
 async function acquireLock(executionId) {
   const token = crypto.randomUUID();
@@ -45,64 +63,31 @@ async function releaseLock(executionId, token) {
   await redis.eval(unlockScript, 1, `${LOCK_PREFIX}${executionId}`, token);
 }
 
-async function getStaleExecutionIds() {
-  const cutoff = Date.now() - HEARTBEAT_TIMEOUT_MS;
-  return redis.zrangebyscore(HEARTBEAT_SET_KEY, 0, cutoff);
-}
-
-// O(1) point lookup against the global index the worker maintains alongside
-// its per-worker processing list. This is the hot path - no SCAN involved.
-// listKey is deterministic from workerId, so we reconstruct it rather than
-// storing it; job is reconstructed by re-parsing raw for the same reason.
-async function lookupProcessingEntry(executionId) {
-  const indexed = await redis.hget(PROCESSING_INDEX_KEY, executionId);
-  if (!indexed) return null;
-  try {
-    const { workerId, raw } = JSON.parse(indexed);
-    return {
-      listKey: `${EXECUTION_QUEUE_KEY}:processing:${workerId}`,
-      raw,
-      job: JSON.parse(raw),
-    };
-  } catch (err) {
-    logger.error({ err, executionId }, "[recovery] unparseable processing index entry");
-    return null;
+function extractPayload(fields) {
+  for (let i = 0; i < fields.length; i += 2) {
+    if (fields[i] === "payload") return fields[i + 1];
   }
+  return null;
 }
 
-// Cold-path fallback for the narrow window where a worker died between its
-// BLMOVE (job safely in its processing list) and the follow-up HSET into
-// PROCESSING_INDEX_KEY. Only runs for ids the index didn't know about, which
-// should be rare, so the SCAN cost here is acceptable.
-async function findInProcessingListsFallback(executionId) {
-  let cursor = "0";
-  do {
-    const [nextCursor, keys] = await redis.scan(
-      cursor,
-      "MATCH",
-      PROCESSING_KEY_PATTERN,
-      "COUNT",
-      100,
-    );
-    cursor = nextCursor;
-
-    for (const listKey of keys) {
-      const entries = await redis.lrange(listKey, 0, -1);
-      for (const raw of entries) {
-        let job;
-        try {
-          job = JSON.parse(raw);
-        } catch {
-          continue;
-        }
-        if (job.execution_id === executionId) {
-          return { listKey, raw, job };
-        }
-      }
-    }
-  } while (cursor !== "0");
-
-  return null;
+// Lists PEL entries idle longer than STALE_IDLE_MS. This is the direct
+// replacement for the old heartbeat zset scan - XPENDING already tracks
+// per-entry idle time and delivery count natively, so there's no separate
+// bookkeeping structure for a worker to maintain (and no crash window
+// between "job claimed" and "bookkeeping written", since the claim IS the
+// bookkeeping).
+async function getStalePendingEntries() {
+  // [id, consumer, idleMs, deliveryCount][]
+  const entries = await redis.xpending(
+    EXECUTION_QUEUE_KEY,
+    EXECUTION_QUEUE_GROUP,
+    "IDLE",
+    STALE_IDLE_MS,
+    "-",
+    "+",
+    CLAIM_BATCH_SIZE,
+  );
+  return entries ?? [];
 }
 
 // Marks a stale execution as failed-with-a-pending-retry after a crash.
@@ -117,18 +102,21 @@ async function rescheduleForRetry(client, executionId, job, attempt) {
 }
 
 // Handles a single stale execution: decide whether the worker actually
-// finished before dying (nothing to do but tidy Redis) or genuinely
+// finished before dying (nothing to do but ack/tidy) or genuinely
 // abandoned it mid-flight (fail the execution, retry/finalize the job).
 //
+// streamId: the entry's ID in EXECUTION_QUEUE_KEY. Passed directly by the
+// worker's fast-path call (it already has it from its own XREADGROUP), or
+// discovered via getStalePendingEntries() by the periodic sweep.
+//
 // skipFreshnessCheck: set by the worker's own fast-path call (see
-// worker.js) when IT is the one telling us the execution was abandoned,
-// e.g. because handleExecution threw and it already stopped heartbeating.
-// In that case there's no heartbeat race to re-check - the worker calling
-// this function *is* the one who owns that heartbeat, so waiting for it to
-// go stale would just add latency for no additional safety. The periodic
-// sweep in runRecoveryCycle() never sets this - it always re-checks
-// freshness, since it's reacting to a heartbeat it doesn't control.
-async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}) {
+// worker.js) when IT is the one telling us the execution was abandoned. In
+// that case there's no idle-time race to re-check - the worker calling
+// this function *is* the one who held the claim, so waiting to see if it
+// goes stale would just add latency for no additional safety. The
+// periodic sweep in runRecoveryCycle() never sets this - it always
+// re-claims via XCLAIM, whose min-idle-time check IS the re-check.
+async function recoverExecution(executionId, streamId, { skipFreshnessCheck = false } = {}) {
   const token = await acquireLock(executionId);
   if (!token) {
     logger.debug({ executionId }, "[recovery] lock held by another recovery run, skipping");
@@ -136,28 +124,53 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
   }
 
   try {
-    if (!skipFreshnessCheck) {
-      // Re-check freshness now that we hold the lock - the worker may have
-      // heartbeated again between our scan and acquiring the lock.
-      const score = await redis.zscore(HEARTBEAT_SET_KEY, executionId);
-      if (score !== null && Number(score) > Date.now() - HEARTBEAT_TIMEOUT_MS) {
-        logger.debug({ executionId }, "[recovery] heartbeat is fresh again, worker is alive");
+    let raw;
+    let deliveryCount = 1;
+
+    if (skipFreshnessCheck) {
+      // The calling worker already owns this entry outright (it's the one
+      // that read it and is now telling us it died on it) - no need to
+      // reclaim, just read the payload back off the stream directly.
+      const range = await redis.xrange(EXECUTION_QUEUE_KEY, streamId, streamId);
+      if (range.length === 0) {
+        logger.warn({ executionId, streamId }, "[recovery] entry no longer in stream, nothing to recover");
         return;
       }
+      raw = extractPayload(range[0][1]);
+    } else {
+      // Re-check via XCLAIM's own min-idle-time gate - if another
+      // worker or recovery run touched this entry more recently than
+      // STALE_IDLE_MS ago, the claim below simply returns nothing and we
+      // back off, exactly like re-checking a heartbeat used to.
+      const claimed = await redis.xclaim(
+        EXECUTION_QUEUE_KEY,
+        EXECUTION_QUEUE_GROUP,
+        RECOVERY_CONSUMER,
+        STALE_IDLE_MS,
+        streamId,
+      );
+      if (claimed.length === 0) {
+        logger.debug({ executionId, streamId }, "[recovery] entry is fresh again or already claimed, skipping");
+        return;
+      }
+      raw = extractPayload(claimed[0][1]);
+
+      const pendingDetail = await redis.xpending(
+        EXECUTION_QUEUE_KEY,
+        EXECUTION_QUEUE_GROUP,
+        streamId,
+        streamId,
+        1,
+      );
+      if (pendingDetail?.[0]) deliveryCount = Number(pendingDetail[0][3]) || 1;
     }
 
-    let entry = await lookupProcessingEntry(executionId);
-    if (!entry) {
-      // Not in the index - either genuinely gone (worker finished and
-      // cleaned up right as we checked) or it hit the narrow BLMOVE->HSET
-      // crash window. Fall back to the slow scan before giving up.
-      entry = await findInProcessingListsFallback(executionId);
-    }
-    if (!entry) {
-      logger.warn({ executionId }, "[recovery] stale heartbeat with no matching processing entry, clearing heartbeat");
-      await redis.zrem(HEARTBEAT_SET_KEY, executionId);
+    if (!raw) {
+      logger.error({ executionId, streamId }, "[recovery] entry missing payload field, acking to drop it");
+      await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
       return;
     }
+    const job = JSON.parse(raw);
 
     // Fast path first: worker's own write-behind status hash, which is
     // written synchronously (see streams/executionResults.js) so it can't
@@ -169,11 +182,7 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
       const execution = await getExecutionById(executionId);
       if (!execution) {
         logger.error({ executionId }, "[recovery] execution not found in postgres, dropping orphaned entry");
-        await redis.multi()
-          .lrem(entry.listKey, 1, entry.raw)
-          .zrem(HEARTBEAT_SET_KEY, executionId)
-          .hdel(PROCESSING_INDEX_KEY, executionId)
-          .exec();
+        await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
         return;
       }
       executionStatus = execution.status;
@@ -181,20 +190,39 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
 
     if (executionStatus === "success" || executionStatus === "failed") {
       // Worker completed the HTTP call and recorded its outcome, but
-      // crashed before it could LREM the processing list / clear the
-      // heartbeat. The execution result is already correct (or queued for
-      // the merger to apply) - just tidy up Redis.
-      logger.info({ executionId, status: executionStatus }, "[recovery] execution already finished, cleaning up Redis only");
-      await redis.multi()
-        .lrem(entry.listKey, 1, entry.raw)
-        .zrem(HEARTBEAT_SET_KEY, executionId)
-        .hdel(PROCESSING_INDEX_KEY, executionId)
-        .exec();
+      // crashed before it could XACK. The execution result is already
+      // correct (or queued for the merger to apply) - just ack it off
+      // the stream.
+      logger.info({ executionId, status: executionStatus }, "[recovery] execution already finished, acking only");
+      await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
       return;
     }
 
-    // Still "running"/"queued" with a dead heartbeat: genuinely abandoned.
-    const job = entry.job;
+    if (deliveryCount > MAX_DELIVERY_COUNT) {
+      // Entry has been claimed and lost this many times without ever
+      // reaching a final status - treat it as poisoned rather than
+      // handing it back out for another worker to choke on. Fail the
+      // job outright (no further retry scheduling) and drop it.
+      logger.error(
+        { executionId, deliveryCount },
+        "[recovery] exceeded max delivery count, failing execution and dropping entry",
+      );
+      await recordExecutionStatus(executionId, "failed");
+      await pushExecutionEvent({
+        executionId,
+        type: "completed",
+        payload: {
+          success: false,
+          error: `Execution abandoned: exceeded max delivery count (${MAX_DELIVERY_COUNT})`,
+          workerId: null,
+        },
+      });
+      await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
+      return;
+    }
+
+    // Still "running"/"queued" with no live claimant: genuinely
+    // abandoned.
     const client = await pool.connect();
     let willRetry = false;
     try {
@@ -233,20 +261,16 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
         type: "completed",
         payload: {
           success: false,
-          error: "Execution abandoned: worker heartbeat lost",
+          error: "Execution abandoned: worker died mid-flight",
           workerId: null,
         },
       });
     }
 
-    await redis.multi()
-      .lrem(entry.listKey, 1, entry.raw)
-      .zrem(HEARTBEAT_SET_KEY, executionId)
-      .hdel(PROCESSING_INDEX_KEY, executionId)
-      .exec();
+    await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
 
     logger.warn(
-      { executionId, jobId: job.job_id, listKey: entry.listKey },
+      { executionId, jobId: job.job_id, streamId },
       "[recovery] recovered abandoned execution",
     );
   } finally {
@@ -257,16 +281,34 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
 export { recoverExecution };
 
 export async function runRecoveryCycle() {
-  const staleIds = await getStaleExecutionIds();
-  if (staleIds.length === 0) return;
+  await ensureExecutionQueueGroup();
 
-  logger.info({ count: staleIds.length }, "[recovery] found stale executions");
+  const staleEntries = await getStalePendingEntries();
+  if (staleEntries.length === 0) return;
 
-  for (const executionId of staleIds) {
+  logger.info({ count: staleEntries.length }, "[recovery] found stale pending entries");
+
+  for (const [streamId, , , deliveryCountRaw] of staleEntries) {
     try {
-      await recoverExecution(executionId);
+      // We don't have execution_id without reading the payload first, and
+      // recoverExecution itself will XCLAIM to read it - so pass a
+      // placeholder for logging and let recoverExecution resolve the real
+      // id off the payload once it has claimed the entry. To keep the
+      // lock keyed correctly, resolve execution_id via a cheap XRANGE
+      // first (no claim side effects) before taking the per-execution
+      // lock.
+      const range = await redis.xrange(EXECUTION_QUEUE_KEY, streamId, streamId);
+      if (range.length === 0) continue; // acked/trimmed between XPENDING and now
+      const raw = extractPayload(range[0][1]);
+      if (!raw) {
+        logger.error({ streamId }, "[recovery] pending entry missing payload field, acking to drop it");
+        await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
+        continue;
+      }
+      const { execution_id: executionId } = JSON.parse(raw);
+      await recoverExecution(executionId, streamId);
     } catch (err) {
-      logger.error({ err, executionId }, "[recovery] unexpected error recovering execution");
+      logger.error({ err, streamId, deliveryCount: deliveryCountRaw }, "[recovery] unexpected error recovering entry");
     }
   }
 }
