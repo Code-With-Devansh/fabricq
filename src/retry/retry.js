@@ -1,111 +1,107 @@
-import redis from "../config/redis.js";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
-import { computeDelaySeconds } from "./backoff.js";
+import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
+import { claimDueRetries } from "../repositories/execution.repository.js";
+import { upsertRetryOutboxEntry } from "../repositories/outbox.repository.js";
+import { publishOutboxEntryNow } from "../outbox/outbox.js";
 
-// Worker/recovery LPUSH onto this when a ONCE job fails but has retries
-// left. This process is the only thing that ever turns a NULL next_run
-// back into a real timestamp for such jobs - once it does, the existing
-// scheduler poll (next_run <= now()) picks it up exactly like any other
-// due job. 
-export const RETRY_INTAKE_KEY = "fabricq:retry:intake";
-
-// LPUSH isn't durable the way the Postgres claim pattern is - if this
-// process is down when a push happens, that job would sit at
-// next_run = NULL forever with nothing watching it. This reconciliation
-// query is the fallback: anything that's been sitting unscheduled for a
-// while gets picked up and given a next_run on the next sweep, same as if
-// its intake message had arrived normally.
-const RECONCILE_STALE_INTERVAL = "1 minute";
-
-async function scheduleRetry(job, attempt) {
-  // const job = await findJobById(jobId);
-  if (!job) {
-    logger.warn({ job }, "[retry] job no longer exists, dropping intake entry");
-    return;
-  }
-  const jobId = job.job_id;
-  if (!job.enabled) {
-    logger.debug({ job:job.job_id }, "[retry] job disabled, skipping retry scheduling");
-    return;
-  }
-  // Nothing to do if it already has a next_run - either another intake
-  // message beat us to it, or the reconciliation sweep already handled it.
-  if (job.next_run !== null) {
-    return;
-  }
-
-  const delaySeconds = computeDelaySeconds(job,attempt);
-
-  await pool.query(
-    `UPDATE http_jobs
-     SET next_run = now() + ($1 || ' seconds')::interval
-     WHERE job_id = $2 AND next_run IS NULL`,
-    [delaySeconds, jobId],
-  );
-
-  logger.info(
-    { jobId, attempt:attempt, strategy: job.retry_strategy, delaySeconds },
-    "[retry] scheduled next attempt",
-  );
-}
-// this keeps running. check this fn
-export async function runReconciliationSweep() {
-  const { rows } = await pool.query(
-    `SELECT *
-     FROM http_jobs
-     WHERE enabled
-       AND schedule_type = 'ONCE'
-       AND next_run IS NULL
-       AND attempts > 0
-       AND attempts < max_attempts
-       AND updated_at < now() - interval '${RECONCILE_STALE_INTERVAL}'`,
-  );
-
-  if (rows.length === 0) return;
-
-  logger.warn(
-    { count: rows.length },
-    "[retry] reconciliation found jobs stuck without next_run, catching up",
-  );
-
-  for (const row of rows) {
-    try {
-      await scheduleRetry(row, row.attempts);
-    } catch (err) {
-      logger.error({ err, jobId: row?.job_id }, "[retry] reconciliation failed for job");
-    }
-  }
+// Reconstructs the same shape worker.js's handleExecution expects (the
+// http_jobs fields it needs to actually re-run the call, plus
+// execution_id/attempt) from a claimDueRetries row.
+function buildRetryPayload(row) {
+  return {
+    job_id: row.hj_job_id,
+    execution_id: row.execution_id,
+    attempt: row.attempt,
+    schedule_type: row.schedule_type,
+    method: row.method,
+    url: row.url,
+    body: row.body,
+    headers: row.headers,
+    query_params: row.query_params,
+    body_type: row.body_type,
+    auth_type: row.auth_type,
+    auth_config: row.auth_config,
+    redirect_mode: row.redirect_mode,
+    redirect_policy: row.redirect_policy,
+    timeout_ms: row.timeout_ms,
+    max_attempts: row.max_attempts,
+    backoff_seconds: row.backoff_seconds,
+    retry_strategy: row.retry_strategy,
+    retry_multiplier: row.retry_multiplier,
+    retry_max_seconds: row.retry_max_seconds,
+  };
 }
 
-let shuttingDown = false;
+// Retry state lives entirely on job_executions now (see migration 020) -
+// there's no separate intake signal to listen for. This process just
+// polls for rows sitting in retry_wait whose retry_at has passed, exactly
+// the same SKIP LOCKED claim pattern as the scheduler's claimDueJobs, and
+// republishes each one through the normal outbox path so the worker picks
+// it up with no retry-specific handling of its own.
+export async function runRetrySweep() {
+  const client = await pool.connect();
+  let claimed = [];
 
-export async function runIntakeLoop() {
-  logger.info("[retry] intake loop started, waiting for failed jobs");
-  while (!shuttingDown) {
-    const item = await redis.brpop(RETRY_INTAKE_KEY, 5);
-    if (!item) continue; // timed out, nothing to do
-    if (shuttingDown) {
-      logger.warn("[retry] popped an intake entry after shutdown was requested, finishing it anyway");
+  try {
+    await client.query("BEGIN");
+    claimed = await claimDueRetries(client);
+
+    if (claimed.length === 0) {
+      await client.query("COMMIT");
+      client.release();
+      return;
     }
 
-    let payload;
-    try {
-      payload = JSON.parse(item[1]);
-    } catch (err) {
-      logger.error({ err, raw: item[1] }, "[retry] unparseable intake entry, dropping");
-      continue;
+    logger.info({ count: claimed.length }, "[retry] claimed due retries");
+
+    // upsertRetryOutboxEntry writes inside this SAME transaction, so a
+    // crash between here and COMMIT rolls the claim back too - the row
+    // just goes back to retry_wait and gets picked up on the next sweep,
+    // never "claimed but never republished".
+    for (const row of claimed) {
+      await upsertRetryOutboxEntry(client, {
+        executionId: row.execution_id,
+        queueKey: EXECUTION_QUEUE_KEY,
+        payload: buildRetryPayload(row),
+      });
     }
 
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    logger.error({ err }, "[retry] failed to claim/requeue due retries, batch rolled back");
+    client.release();
+    return;
+  }
+
+  client.release();
+
+  // Same fast-path-then-relay-backstop shape as the scheduler: publish
+  // immediately for low latency, but if this fails or the process dies
+  // right here, the outbox row is already durable and the relay sweep
+  // will publish it on its next tick - nothing is lost.
+  for (const row of claimed) {
     try {
-      await scheduleRetry(payload.job, payload.attempt);
+      // Per-attempt dedupe key (see outbox.js) - this execution_id was
+      // already published once for its previous attempt, so reusing the
+      // bare execution_id as the dedupe key would make this republish a
+      // silent no-op.
+      const published = await publishOutboxEntryNow({
+        executionId: row.execution_id,
+        queueKey: EXECUTION_QUEUE_KEY,
+        dedupeKey: `${row.execution_id}:${row.attempt}`,
+        payload: buildRetryPayload(row),
+      });
+      logger.info(
+        { executionId: row.execution_id, attempt: row.attempt, published },
+        published ? "[retry] retry requeued" : "[retry] retry requeued, deferred to outbox relay",
+      );
     } catch (err) {
-      logger.error({ err, payload }, "[retry] failed to schedule retry, will be caught by reconciliation sweep");
+      logger.error(
+        { err, executionId: row.execution_id },
+        "[retry] fast-path publish failed, retry left for outbox relay",
+      );
     }
   }
-  logger.info("[retry] intake loop exited");
-}
-
-export function requestShutdown() {
-  shuttingDown = true;
 }

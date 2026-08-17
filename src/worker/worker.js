@@ -4,11 +4,9 @@ import logger from "../config/logger/index.js";
 import os from "os";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import {
-  finalizeJobRun,
-  getJobById,
-  markJobFailedAwaitingRetry,
+  disableJob,
 } from "../repositories/httpJob.repository.js";
-import { RETRY_INTAKE_KEY } from "../retry/retry.js";
+import { scheduleExecutionRetry } from "../retry/scheduleRetry.js";
 import config from "../config/index.js";
 import {
   pushExecutionEvent,
@@ -305,44 +303,46 @@ async function executeHttpJob(execution) {
 async function handleExecution(job) {
   const result = await executeHttpJob(job);
 
-  // Scheduling-critical state (attempts/next_run/enabled on http_jobs)
-  // stays on the synchronous Postgres path, driven entirely off the
-  // in-memory `result` - it never reads or waits on job_executions, so
-  // deferring the execution-detail row below can't create a race here.
+  // Scheduling-critical state stays on the synchronous Postgres path,
+  // driven entirely off the in-memory `result` - it never reads or waits
+  // on the write-behind execution-detail path below, so deferring that
+  // can't create a race here.
+  //
+  // Retry state lives entirely on this execution's own job_executions row
+  // (see migration 020) - http_jobs.next_run is a pure schedule cursor
+  // that already advanced independently at claim time (scheduler.js) and
+  // is never touched here, for ONCE or CRON alike. The only http_jobs
+  // write left is disabling a ONCE job once it's fully resolved.
   const client = await pool.connect();
+  let willRetry = false;
   try {
     await client.query("BEGIN");
 
     const isRecurring = job.schedule_type === "CRON";
-    const nextAttempt = job.attempts + 1;
-    const exhaustedRetries = nextAttempt >= job.max_attempts;
+    const attempt = job.attempt; // this execution's current attempt number
+    const exhausted = attempt >= job.max_attempts;
 
     if (result.success) {
-      await finalizeJobRun(client, job.job_id, {
-        isRecurring,
-        success : true
+      if (!isRecurring) {
+        await disableJob(client, job.job_id);
+      }
+    } else if (!exhausted) {
+      // Retries now work the same way for ONCE and CRON: a single
+      // triggered execution gets retried in place, independent of the
+      // job's own schedule cursor. See migration 020 / scheduleRetry.js.
+      await scheduleExecutionRetry(client, {
+        executionId: job.execution_id,
+        job,
+        attempt,
       });
-    } else if (!isRecurring && !exhaustedRetries) {
-      // ONCE job that failed but has retries left: worker's job ends here.
-      // It does NOT compute a backoff delay - it just marks the attempt and
-      // leaves next_run NULL, then hands off to the retry scheduler, which
-      // owns all backoff-policy logic (see src/retry/retry.js).
-      await markJobFailedAwaitingRetry(client, job.job_id);
-    } else {
-      await finalizeJobRun(client, job.job_id, {
-        isRecurring,
-        success : false
-      });
+      willRetry = true;
+    } else if (!isRecurring) {
+      await disableJob(client, job.job_id);
     }
+    // CRON, exhausted: nothing to do to http_jobs - the next tick is
+    // already scheduled regardless of this execution's outcome.
 
     await client.query("COMMIT");
-
-    if (!result.success && !isRecurring && !exhaustedRetries) {
-      await redis.lpush(
-        RETRY_INTAKE_KEY,
-        JSON.stringify({ job: job, attempt: nextAttempt }),
-      );
-    }
   } catch (err) {
     await client.query("ROLLBACK");
     logger.error(
@@ -358,19 +358,27 @@ async function handleExecution(job) {
   // record the outcome in Redis (fast, synchronous, cheap - used by
   // recovery.js so it never races the merger) and hand the heavy payload
   // off to the stream for the merger process to batch into Postgres.
-  const status = result.success ? "success" : "failed";
-  await recordExecutionStatus(job.execution_id, status);
-  await pushExecutionEvent({
-    executionId: job.execution_id,
-    type: "completed",
-    payload: { ...result, workerId: WORKER_ID },
-  });
+  //
+  // A retry doesn't get "completed" here - scheduleExecutionRetry already
+  // moved the row to retry_wait above, and the retry scheduler will flip
+  // it to queued and republish it. Only genuinely final outcomes
+  // (success, or failure with no retries left) get recorded as such.
+  if (!willRetry) {
+    const status = result.success ? "success" : "failed";
+    await recordExecutionStatus(job.execution_id, status);
+    await pushExecutionEvent({
+      executionId: job.execution_id,
+      type: "completed",
+      payload: { ...result, workerId: WORKER_ID },
+    });
+  }
 
   logger.info(
     {
       executionId: job.execution_id,
       jobId: job.job_id,
       success: result.success,
+      willRetry,
     },
     "[worker] execution finished",
   );

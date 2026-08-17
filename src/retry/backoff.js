@@ -12,9 +12,9 @@ function fibonacci(n) {
   return a;
 }
 
-// attempt is 1-indexed: the attempt number that just failed (job.attempts
-// after the worker/recovery increment). computeDelaySeconds answers "how
-// long to wait before the *next* attempt".
+// attempt is 1-indexed: the attempt number about to be tried (i.e. the one
+// that just failed, plus one - see scheduleRetry.js). computeDelaySeconds
+// answers "how long to wait before that attempt".
 export function computeDelaySeconds(job, attempt) {
   const base = job.backoff_seconds;
   const multiplier = Number(job.retry_multiplier);

@@ -39,12 +39,21 @@ return 0
 // did and this one is a harmless no-op) - i.e. "the caller can safely
 // mark this row published". Returns false only on a Redis-level failure,
 // in which case the row is left unpublished for the next sweep to retry.
-async function publishOne({ executionId, queueKey, payload }) {
+//
+// dedupeKey defaults to the execution_id, which is correct for a normal
+// first-time schedule (one execution_id is only ever published once).
+// Retries reuse the SAME execution_id (see migration 020 - a retry
+// mutates the execution row in place rather than creating a new one), so
+// the retry scheduler passes `${executionId}:${attempt}` instead - a
+// fresh dedupe key per attempt. Without that, the second, third, etc.
+// retry of the same execution would hit the still-live dedupe entry from
+// attempt 1 and silently never get pushed.
+async function publishOne({ executionId, queueKey, payload, dedupeKey = executionId }) {
   try {
     await redis.eval(
       PUBLISH_SCRIPT,
       2,
-      `${PUBLISHED_SET_PREFIX}${executionId}`,
+      `${PUBLISHED_SET_PREFIX}${dedupeKey}`,
       queueKey,
       executionId,
       JSON.stringify(payload),
@@ -62,8 +71,8 @@ async function publishOne({ executionId, queueKey, payload }) {
 // nothing is lost, because the row is already durably in
 // execution_outbox with published_at still NULL and the relay sweep
 // (publishPendingExecutions) will pick it up.
-export async function publishOutboxEntryNow({ executionId, queueKey, payload }) {
-  const ok = await publishOne({ executionId, queueKey, payload });
+export async function publishOutboxEntryNow({ executionId, queueKey, payload, dedupeKey }) {
+  const ok = await publishOne({ executionId, queueKey, payload, dedupeKey });
   if (!ok) return false;
 
   return markOutboxPublished(executionId);

@@ -13,7 +13,6 @@ export async function createJob(job) {
       cron_expression,
       enabled,
       max_attempts,
-      attempts,
       backoff_seconds,
       next_run,
       query_params,
@@ -39,8 +38,8 @@ export async function createJob(job) {
       $9,
       $10,
       $11,
-      $12,
-      to_timestamp($13::bigint),
+      to_timestamp($12::bigint),
+      $13,
       $14,
       $15,
       $16,
@@ -49,8 +48,7 @@ export async function createJob(job) {
       $19,
       $20,
       $21,
-      $22,
-      $23::jsonb
+      $22::jsonb
  )
     RETURNING *;
   `;
@@ -66,7 +64,6 @@ export async function createJob(job) {
     job.cron_expression ?? null,
     job.enabled ?? true,
     job.max_attempts,
-    job.attempts,
     job.backoff_seconds,
     job.next_run,
     job.query_params ?? {},
@@ -145,48 +142,18 @@ export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) 
   }
 }
 
-// ONCE job failed but has retries left: worker/recovery no longer compute
-// the backoff delay themselves. This just records the attempt and leaves
-// next_run NULL - the retry scheduler is the only thing that turns it back
-// into a real timestamp (see src/retry/retry.js), based on the job's
-// configurable retry_strategy.
-export async function markJobFailedAwaitingRetry(client, jobId) {
+// ONCE job's execution has fully resolved (succeeded, or failed with no
+// retries left) - it never runs again, so disable it. CRON jobs need no
+// equivalent call: next_run is a pure schedule cursor that already
+// advanced independently at claim time (see scheduler.js), and doesn't
+// care how this execution's retries turned out. Retry state itself lives
+// entirely on job_executions now (see migration 020) - http_jobs has
+// nothing left to record when an execution resolves.
+export async function disableJob(client, jobId) {
   await client.query(
-    `UPDATE http_jobs
-     SET attempts = attempts + 1,
-         next_run = NULL,
-         locked_at = NULL,
-         updated_at = now()
-     WHERE job_id = $1`,
-    [jobId],
+    `UPDATE http_jobs SET enabled = false, updated_at = now() WHERE job_id = $1`,
+    [jobId]
   );
-}
-
-export async function finalizeJobRun(client, jobId, { isRecurring, success }) {
-  if (isRecurring) {
-    // CRON jobs never "exhaust retries" (retry/backoff logic is ONCE-only -
-    // see retry.js) and this value gates no control flow for them, so
-    // there's nothing to increment on failure or reset on success here.
-    // Per-run attempt count for recurring jobs already lives on
-    // job_executions.attempt (see execution.repository.js). Leaving the
-    // old increment-on-failure-only logic in place meant attempts climbed
-    // forever across a CRON job's lifetime with nothing ever resetting it,
-    // eventually tripping the `attempts <= max_attempts` check constraint
-    // on every subsequent failed run - permanently, since the row was
-    // already over the limit.
-    await client.query(
-      `UPDATE http_jobs SET updated_at = now() WHERE job_id = $1`,
-      [jobId]
-    );
-  } else {
-    await client.query(
-      `UPDATE http_jobs
-       SET attempts = attempts + 1,
-           enabled = false, updated_at = now()
-       WHERE job_id = $1`,
-      [jobId]
-    );
-  }
 }
 
 export async function getJobById(client, jobId) {

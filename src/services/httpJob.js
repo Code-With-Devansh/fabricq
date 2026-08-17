@@ -25,7 +25,6 @@ export const createJobService = async (teamId, data) => {
     ...data,
     team_id: teamId,
     next_run,
-    attempts: 0,
   });
 };
 

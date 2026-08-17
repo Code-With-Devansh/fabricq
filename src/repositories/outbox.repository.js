@@ -11,6 +11,27 @@ export async function createOutboxEntry(client, { executionId, queueKey, payload
   );
 }
 
+// Retry requeue path: the execution_id already has an outbox row from its
+// original schedule (possibly already published_at IS NOT NULL by now).
+// Upsert it back to "unpublished" with the new payload (bumped attempt,
+// fresh retry state) instead of inserting a second row - retries reuse the
+// same execution row (see migration 020), so they reuse its outbox row
+// too. created_at resets along with it so the relay's staleAfter window
+// is measured from this requeue, not the original schedule time.
+export async function upsertRetryOutboxEntry(client, { executionId, queueKey, payload }) {
+  await client.query(
+    `INSERT INTO execution_outbox (execution_id, queue_key, payload)
+     VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (execution_id) DO UPDATE
+     SET queue_key = EXCLUDED.queue_key,
+         payload = EXCLUDED.payload,
+         published_at = NULL,
+         publish_attempts = 0,
+         created_at = now()`,
+    [executionId, queueKey, JSON.stringify(payload)]
+  );
+}
+
 // Best-effort fast path: called right after the scheduling transaction
 // commits, so most executions get published within the same tick instead
 // of waiting for the relay sweep. Only marks published if it's still

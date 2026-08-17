@@ -1,46 +1,40 @@
 import cron from "node-cron";
 import logger from "../config/logger/index.js";
-import {
-  runIntakeLoop,
-  runReconciliationSweep,
-  requestShutdown,
-} from "./retry.js";
+import { runRetrySweep } from "./retry.js";
 
-let intakeLoopPromise = null;
+// No more Redis intake to listen for - retry state lives entirely on
+// job_executions (see migration 020), so this process just polls for due
+// retry_wait rows. 5s cadence keeps IMMEDIATE/short-backoff retries feeling
+// responsive without hammering Postgres; claimDueRetries' partial index
+// keeps each poll cheap even when idle.
 let sweepRunning = false;
 let sweepTask = null;
 let shuttingDown = false;
 
 export function startRetryScheduler() {
-  intakeLoopPromise = runIntakeLoop();
-
-  sweepTask = cron.schedule("*/30 * * * * *", async () => {
+  sweepTask = cron.schedule("*/5 * * * * *", async () => {
     if (shuttingDown) return;
     if (sweepRunning) {
-      logger.warn("[retry] previous reconciliation sweep still running, skipping this tick");
+      logger.warn("[retry] previous sweep still running, skipping this tick");
       return;
     }
     sweepRunning = true;
     try {
-      await runReconciliationSweep();
+      await runRetrySweep();
     } catch (err) {
-      logger.error({ err }, "[retry] reconciliation sweep failed");
+      logger.error({ err }, "[retry] sweep failed");
     } finally {
       sweepRunning = false;
     }
   });
 
-  logger.info("[retry] started: intake loop live, reconciliation sweep every 30s");
+  logger.info("[retry] started: polling for due retries every 5s");
 }
 
 export async function stopRetryScheduler() {
   shuttingDown = true;
-  requestShutdown();
   if (sweepTask) sweepTask.stop();
 
-  if (intakeLoopPromise) {
-    await intakeLoopPromise.catch(() => {});
-  }
   while (sweepRunning) {
     await new Promise((r) => setTimeout(r, 100));
   }

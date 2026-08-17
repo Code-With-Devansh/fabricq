@@ -20,8 +20,8 @@ async function gracefulShutdown(signal) {
   forceTimer.unref?.();
 
   try {
-    // Stops the intake loop and the reconciliation cron, waiting for
-    // whichever is in-flight to finish before we tear down connections.
+    // Stops the polling sweep, waiting for an in-flight one to finish
+    // before we tear down connections.
     await stopRetryScheduler();
 
     await Promise.all([pool.end(), redis.quit()]);

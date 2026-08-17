@@ -109,7 +109,7 @@ export async function pollAndScheduleDueJobs() {
 
 async function scheduleOne(client, job) {
   const isRecurring = job.schedule_type === "CRON";
-  const attempt = job.attempts + 1;
+  const attempt = 1;
   const scheduledForEpoch = Math.floor(new Date(job.next_run).getTime() / 1000);
 
   const execution = await createExecution(client, {
@@ -124,7 +124,7 @@ async function scheduleOne(client, job) {
   await createOutboxEntry(client, {
     executionId: execution.execution_id,
     queueKey: EXECUTION_QUEUE_KEY,
-    payload: { ...job, execution_id: execution.execution_id },
+    payload: { ...job, execution_id: execution.execution_id, attempt },
   });
 
   return execution;

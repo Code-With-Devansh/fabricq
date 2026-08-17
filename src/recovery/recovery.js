@@ -5,8 +5,8 @@ import logger from "../config/logger/index.js";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import { HEARTBEAT_SET_KEY, PROCESSING_INDEX_KEY } from "../worker/worker.js";
 import { getExecutionById } from "../repositories/execution.repository.js";
-import { finalizeJobRun, markJobFailedAwaitingRetry } from "../repositories/httpJob.repository.js";
-import { RETRY_INTAKE_KEY } from "../retry/retry.js";
+import { disableJob } from "../repositories/httpJob.repository.js";
+import { scheduleExecutionRetry } from "../retry/scheduleRetry.js";
 import {
   pushExecutionEvent,
   recordExecutionStatus,
@@ -105,15 +105,15 @@ async function findInProcessingListsFallback(executionId) {
   return null;
 }
 
-// Marks a non-recurring job as failed-awaiting-retry after a crash. Mirrors
-// the retry branch in worker.js's handleExecution so a crash and a clean
-// failure end up in the same place: attempts recorded, next_run left NULL,
-// and the retry scheduler notified via Redis intake. Clearing locked_at
-// here matters more than in the clean-failure path: the dead worker never
-// released it, so without this the job would just sit until the 1-minute
-// lease expiry.
-async function rescheduleForRetry(client, jobId) {
-  await markJobFailedAwaitingRetry(client, jobId);
+// Marks a stale execution as failed-with-a-pending-retry after a crash.
+// Mirrors the retry branch in worker.js's handleExecution so a crash and a
+// clean failure end up in the same place: this exact execution row moves
+// to retry_wait, independent of the job's own next_run cursor (ONCE or
+// CRON alike - see migration 020). Locked_at needs no attention here -
+// http_jobs.next_run/locked_at already advanced independently at claim
+// time (scheduler.js), regardless of how this execution resolves.
+async function rescheduleForRetry(client, executionId, job, attempt) {
+  await scheduleExecutionRetry(client, { executionId, job, attempt });
 }
 
 // Handles a single stale execution: decide whether the worker actually
@@ -196,34 +196,23 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
     // Still "running"/"queued" with a dead heartbeat: genuinely abandoned.
     const job = entry.job;
     const client = await pool.connect();
+    let willRetry = false;
     try {
       await client.query("BEGIN");
 
       const isRecurring = job.schedule_type === "CRON";
-      // Same off-by-one fix as worker.js: count this attempt before
-      // deciding whether retries are exhausted, so finalizeJobRun's +1
-      // never pushes attempts past max_attempts.
-      const nextAttempt = job.attempts + 1;
-      const exhaustedRetries = nextAttempt >= job.max_attempts;
-      const willRetry = !isRecurring && !exhaustedRetries;
+      const attempt = job.attempt;
+      const exhausted = attempt >= job.max_attempts;
+      willRetry = !exhausted;
 
       if (willRetry) {
-        await rescheduleForRetry(client, job.job_id);
-      } else {
-        await finalizeJobRun(client, job.job_id, {
-          isRecurring,
-          success : false
-        });
+        await rescheduleForRetry(client, executionId, job, attempt);
+      } else if (!isRecurring) {
+        await disableJob(client, job.job_id);
       }
+      // CRON, exhausted: nothing to do to http_jobs, same as worker.js.
 
       await client.query("COMMIT");
-
-      if (willRetry) {
-        await redis.lpush(
-          RETRY_INTAKE_KEY,
-          JSON.stringify({ job:job, attempt: nextAttempt }),
-        );
-      }
     } catch (err) {
       await client.query("ROLLBACK");
       logger.error({ err, executionId, jobId: job.job_id }, "[recovery] failed to recover abandoned execution, leaving in place for next cycle");
@@ -234,16 +223,21 @@ async function recoverExecution(executionId, { skipFreshnessCheck = false } = {}
 
     // Execution-detail row, same write-behind path as worker.js: fast
     // status recorded synchronously, heavy payload deferred to the merger.
-    await recordExecutionStatus(executionId, "failed");
-    await pushExecutionEvent({
-      executionId,
-      type: "completed",
-      payload: {
-        success: false,
-        error: "Execution abandoned: worker heartbeat lost",
-        workerId: null,
-      },
-    });
+    // Only a genuinely final outcome gets recorded this way - a retry
+    // already moved the row to retry_wait above, and the retry scheduler
+    // owns republishing it from there.
+    if (!willRetry) {
+      await recordExecutionStatus(executionId, "failed");
+      await pushExecutionEvent({
+        executionId,
+        type: "completed",
+        payload: {
+          success: false,
+          error: "Execution abandoned: worker heartbeat lost",
+          workerId: null,
+        },
+      });
+    }
 
     await redis.multi()
       .lrem(entry.listKey, 1, entry.raw)
