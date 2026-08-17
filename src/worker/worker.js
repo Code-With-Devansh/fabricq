@@ -17,6 +17,11 @@ import {
   recordExecutionStatus,
 } from "../streams/executionResults.js";
 import { recoverExecution } from "../recovery/recovery.js";
+import {
+  assertUrlSyntaxIsSafe,
+  ssrfSafeAgent,
+  SsrfBlockedError,
+} from "../validators/ssrf_guard.js";
 
 const WORKER_ID = `${os.hostname()}:${process.pid}`;
 const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
@@ -128,18 +133,55 @@ async function executeHttpJob(execution) {
       }
       visitedUrls.add(url);
 
+      // SSRF guard: check scheme/IP-literal/blocked-hostname synchronously,
+      // then fetch through an agent that pins the DNS resolution used for
+      // the syntax check to the one used for the actual TCP connect - this
+      // must run on every hop (initial URL and every redirect target),
+      // since users control redirect destinations just as much as the
+      // initial URL.
+      try {
+        assertUrlSyntaxIsSafe(url);
+      } catch (err) {
+        return {
+          success: false,
+          responseStatus: null,
+          responseBody: null,
+          redirectOccurred: redirects.length > 0,
+          redirectCount: redirects.length,
+          redirects,
+          error: err instanceof SsrfBlockedError ? err.message : String(err),
+        };
+      }
+
       let headers = {
         ...buildAuthHeaders(execution),
         ...(execution.headers ?? {}),
       };
 
-      const res = await fetch(url, {
-        method,
-        headers,
-        body,
-        redirect: "manual",
-        signal: controller.signal,
-      });
+      let res;
+      try {
+        res = await fetch(url, {
+          method,
+          headers,
+          body,
+          redirect: "manual",
+          signal: controller.signal,
+          dispatcher: ssrfSafeAgent,
+        });
+      } catch (err) {
+        if (err instanceof SsrfBlockedError || err?.cause instanceof SsrfBlockedError) {
+          return {
+            success: false,
+            responseStatus: null,
+            responseBody: null,
+            redirectOccurred: redirects.length > 0,
+            redirectCount: redirects.length,
+            redirects,
+            error: (err.cause ?? err).message,
+          };
+        }
+        throw err;
+      }
 
       if (!REDIRECT_STATUS_CODES.has(res.status)) {
         const responseBody = await res.text();

@@ -7,25 +7,15 @@ COMMIT
 
 for only this scheduling update, you don't need an explicit transaction. worker.js line 303 const client = await pool.connect();
 
-0.3 still need to check if i has to put success = true or false here recovery.js
-await finalizeJobRun(client, job.job_id, {
-          isRecurring,
-          success = false
-        });
+0.4 not all failures should schedule for retry.
 
-0.4 Fix — this is probably your best ROI for API latency:
-Cache {key_hash → {teamId, scopes, revoked_at, expires_at}} in Redis with a short TTL (30-60s) keyed by prefix. On revoke/rotate, explicitly delete the cache key (you already have the repository layer to hook into).
-Batch touchLastUsed — instead of a write per request, increment a Redis counter/set last_used:{keyId} = now() and flush to Postgres on a cron (every 30-60s), the same outbox-relay pattern you already use elsewhere. Turns N writes/sec into 1 batched write every 30s.
-
-0.5 job_executions and execution_outbox unbounded growth
+0.5 job_executions and execution_outbox, redis streams unbounded growth
 
 0.6 listJobsForTeam runs the full WHERE twice (data query + separate COUNT(*)) — for large teams this doubles scan cost. Consider COUNT(*) OVER() as a window function in the single query instead of two round trips, or cap/estimate counts for large result sets.
 
 0.7 claimDueJobs polls every 10s regardless of load — fine at your current scale, but if you want sub-second scheduling latency later, consider Postgres LISTEN/NOTIFY (trigger on insert/update of next_run) to wake the scheduler immediately instead of waiting for the next tick, falling back to polling as a safety net (you already have the "poll as backstop" pattern from the outbox).
 
-1. user can queue job that has already been expired
-
-2.One further issue matters for your job-execution system: redirect limits and loop detection are not enough to prevent SSRF. Since users control the HTTP destination, every redirect target should go through the same URL/IP validation as the initial URL, including blocking private/link-local/loopback destinations if your service is exposed to untrusted users.
+2.improved some security, further can be improved.  ref: https://pixel-mart.in/1s07T
 
 3. add raw body type ref: https://pixel-mart.in/1s07O
 
@@ -36,27 +26,10 @@ allows this invalid row:
 is_system = false
 team_id   = NULL
 
-2. make watchdog and reapers
-
-3. Execution lease → determines whether a specific job can be recovered. the job lock type  ref : https://pixel-mart.in/1s07K
-
-
-9. productionLogger.js has no redact config (the dev logger does). Since auth_config can contain bearer tokens/passwords and gets logged in job objects, add the same redaction (auth_config.token, auth_config.password, auth_config.value) to the prod logger. 
-
-10. The API lets a caller POST any URL for the worker fleet to fetch server-side, with no allowlist/blocklist. That's a textbook SSRF vector — someone could point a job at http://169.254.169.254/latest/meta-data/ (cloud metadata endpoint) or your internal network/localhost and use your workers as a proxy. Add validation: block private/link-local IP ranges and localhost, and consider resolving DNS and re-checking the resolved IP (to stop DNS-rebinding).
-
 11. auth_config (bearer tokens, basic-auth passwords, API keys) is stored as plaintext JSONB. If this DB is ever read by an analyst, backup, or breached, all downstream credentials leak. Consider app-level encryption (e.g., encrypt auth_config with a KMS-managed key before insert).ref: https://pixel-mart.in/1s07P
 
-13. cors() is wide open (*) — restrict to known origins if this is called from a browser-facing app.
 
 18. Single scheduler container is fine correctness-wise (SKIP LOCKED means you could even run several), but there's no documented scale-out for it in compose the way there is for worker — worth deciding if you want scheduler redundancy or accept it as a single point of latency (not correctness, since a restart just resumes polling).
-
-
-scaling issues:
-1. One thing worth your attention: the lock's PX 15000 is shorter than a possible slow Postgres transaction — if recoverExecution ever takes longer than that, a second recovery process could theoretically jump in before finally releases it. Given your current single-instance deployment this is a non-issue, but if you ever run recovery as more than one replica, bump LOCK_TTL_MS or refresh the lock mid-operation.
-
-2. The old SCAN fallback isn't gone, just demoted. It only fires for an execution that's stale and missing from the index — the narrow crash window between the worker's BLMOVE and its follow-up HSET. That should be rare (order of one process crash landing in a ~1ms gap), so its O(N) cost is now the exception path, not the steady state.
-
 
 
 
