@@ -1,6 +1,7 @@
 import { AppError } from "../Error/appError.js";
 import { hashApiKey, extractPrefix, looksLikeApiKey } from "../utils/apiKey.js";
-import { findByPrefix, touchLastUsed } from "../repositories/apiKey.repository.js";
+import { findByPrefix } from "../repositories/apiKey.repository.js";
+import { markKeyUsed } from "../cache/apiKeyCache.js";
 
 /**
  * Authenticates the public API (/v1/*) via `Authorization: Bearer fq_live_...`.
@@ -43,7 +44,10 @@ export async function authenticateApiKey(req, res, next) {
     };
 
     // Don't block the request on this - last_used_at is best-effort.
-    touchLastUsed(match.id).catch(() => {});
+    // Written to a Redis ZSET and flushed to Postgres in a batch on a
+    // cron (see cache/apiKeyCache.js + the flush loop in app startup),
+    // instead of one UPDATE per request.
+    markKeyUsed(match.id).catch(() => {});
 
     return next();
   } catch (err) {

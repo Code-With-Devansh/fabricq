@@ -4,6 +4,10 @@ import logger from "./config/logger/index.js";
 import { setShuttingDown } from "./state/shutdown.js";
 import config from "./config/index.js";
 import { mailQueue } from "./queues/mail.queue.js";
+import {
+  startApiKeyLastUsedFlusher,
+  stopApiKeyLastUsedFlusher,
+} from "./cache/apiKeyLastUsedFlusher.js";
 
 let server;
 let isShuttingDown = false;
@@ -28,6 +32,7 @@ async function gracefulShutdown(signal) {
     });
     logger.info("HTTP server closed");
 
+    await stopApiKeyLastUsedFlusher();
     await Promise.all([redis.quit(), mailQueue.close()]);
     logger.info("MongoDB & Redis connection closed");
 
@@ -47,6 +52,8 @@ async function startServer() {
     server = app.listen(PORT, () => {
       logger.info({ port: PORT }, "Server started");
     });
+
+    startApiKeyLastUsedFlusher();
 
     process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
     process.on("SIGINT", () => gracefulShutdown("SIGINT"));

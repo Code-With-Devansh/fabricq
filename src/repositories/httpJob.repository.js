@@ -164,8 +164,18 @@ export async function markJobFailedAwaitingRetry(client, jobId) {
 
 export async function finalizeJobRun(client, jobId, { isRecurring, success }) {
   if (isRecurring) {
+    // CRON jobs never "exhaust retries" (retry/backoff logic is ONCE-only -
+    // see retry.js) and this value gates no control flow for them, so
+    // there's nothing to increment on failure or reset on success here.
+    // Per-run attempt count for recurring jobs already lives on
+    // job_executions.attempt (see execution.repository.js). Leaving the
+    // old increment-on-failure-only logic in place meant attempts climbed
+    // forever across a CRON job's lifetime with nothing ever resetting it,
+    // eventually tripping the `attempts <= max_attempts` check constraint
+    // on every subsequent failed run - permanently, since the row was
+    // already over the limit.
     await client.query(
-      `UPDATE http_jobs SET ${!success?"attempts = attempts + 1,":""} updated_at = now() WHERE job_id = $1`,
+      `UPDATE http_jobs SET updated_at = now() WHERE job_id = $1`,
       [jobId]
     );
   } else {
