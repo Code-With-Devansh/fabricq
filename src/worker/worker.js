@@ -13,7 +13,6 @@ import config from "../config/index.js";
 import {
   pushExecutionEvent,
   recordExecutionStatus,
-  clearExecutionStatus,
 } from "../streams/executionResults.js";
 // NOTE: recovery.js imports HEARTBEAT_SET_KEY/PROCESSING_INDEX_KEY from this
 // module, so this is a circular import. That's fine here - recoverExecution

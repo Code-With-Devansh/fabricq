@@ -5,6 +5,7 @@ import {
   STREAM_KEY,
   GROUP_NAME,
   ensureConsumerGroup,
+  clearExecutionStatus,
 } from "../streams/executionResults.js";
 import {
   markExecutionsRunningBatch,
@@ -80,6 +81,16 @@ async function flush(entries) {
     throw err; // don't XACK - let it get redelivered / claimed
   } finally {
     client.release();
+  }
+
+  if (completedByExec.size > 0) {
+    await Promise.all(
+      [...completedByExec.keys()].map((executionId) =>
+        clearExecutionStatus(executionId).catch((err) =>
+          logger.warn({ err, executionId }, "[merger] failed to clear execution status entry")
+        )
+      )
+    );
   }
 
   await redis.xack(STREAM_KEY, GROUP_NAME, ...entries.map((e) => e.id));
