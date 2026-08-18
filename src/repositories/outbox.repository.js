@@ -11,6 +11,25 @@ export async function createOutboxEntry(client, { executionId, queueKey, payload
   );
 }
 
+// Batched version of createOutboxEntry for the scheduler's per-tick claim
+// batch - see execution.repository.js's createExecutionBatch for why this
+// exists. `entries` is [{ executionId, queueKey, payload }, ...]. Each
+// payload is JSON.stringify'd individually and the whole array is cast
+// ::jsonb[] so Postgres parses each element on the way in.
+export async function createOutboxEntryBatch(client, entries) {
+  if (entries.length === 0) return;
+  const executionIds = entries.map((e) => e.executionId);
+  const queueKeys = entries.map((e) => e.queueKey);
+  const payloads = entries.map((e) => JSON.stringify(e.payload));
+
+  await client.query(
+    `INSERT INTO execution_outbox (execution_id, queue_key, payload)
+     SELECT execution_id, queue_key, payload
+     FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[]) AS t(execution_id, queue_key, payload)`,
+    [executionIds, queueKeys, payloads]
+  );
+}
+
 // Retry requeue path: the execution_id already has an outbox row from its
 // original schedule (possibly already published_at IS NOT NULL by now).
 // Upsert it back to "unpublished" with the new payload (bumped attempt,

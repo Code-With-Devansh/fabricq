@@ -94,7 +94,12 @@ export async function createJob(job) {
 // team_id filtering. Team scoping is purely an API/authorization concern,
 // applied only in the team-scoped functions below.
 
-export async function claimDueJobs(client, limit = 100) {
+// Configurable via SCHEDULER_BATCH_SIZE so the batch size can be tuned
+// independently of a code deploy once the claim->work path is fast
+// (batched writes below keep lock-hold time roughly flat as this grows).
+export const DEFAULT_CLAIM_LIMIT = Number(process.env.SCHEDULER_BATCH_SIZE) || 100;
+
+export async function claimDueJobs(client, limit = DEFAULT_CLAIM_LIMIT) {
   const { rows } = await client.query(
     `
     UPDATE http_jobs
@@ -124,6 +129,49 @@ export async function claimDueJobs(client, limit = 100) {
 // is structurally unreachable by the next poll, regardless of how long
 // execution takes or how stale locked_at looks - it's not depending on a
 // timing threshold anymore. See scheduler.js for the full rationale.
+// Batched version of markJobScheduled for the scheduler's per-tick claim
+// batch - see execution.repository.js's createExecutionBatch for the
+// round-trip rationale. `entries` is
+// [{ jobId, nextRun (epoch seconds or null), isRecurring }, ...].
+// nextRun must be null for ONCE jobs (isRecurring: false); the CASE keys
+// off isRecurring rather than trusting nextRun's nullness alone, so a
+// caller bug can't accidentally leave a CRON job's next_run cleared.
+export async function markJobScheduledBatch(client, entries) {
+  if (entries.length === 0) return;
+  const jobIds = entries.map((e) => e.jobId);
+  const nextRuns = entries.map((e) => e.nextRun);
+  const isRecurringFlags = entries.map((e) => e.isRecurring);
+
+  await client.query(
+    `UPDATE http_jobs AS h
+     SET next_run = CASE WHEN d.is_recurring THEN to_timestamp(d.next_run::bigint) ELSE NULL END,
+         locked_at = NULL,
+         updated_at = now()
+     FROM UNNEST($1::uuid[], $2::bigint[], $3::bool[]) AS d(job_id, next_run, is_recurring)
+     WHERE h.job_id = d.job_id`,
+    [jobIds, nextRuns, isRecurringFlags]
+  );
+}
+
+// Releases the claim (locked_at) on jobs that were claimed by claimDueJobs
+// but excluded from this tick's batch - e.g. a malformed cron_expression
+// that fails computeNextRunEpoch before any write happens. Without this,
+// a job that fails validation stays claimed forever: claimDueJobs' WHERE
+// clause filters on locked_at IS NULL, and nothing else ever clears it,
+// so the job silently drops out of scheduling until someone notices.
+// next_run is left untouched so the job is still "due" and gets reclaimed
+// (and re-fail, visibly, in the logs) on the very next poll rather than
+// disappearing.
+export async function releaseJobClaims(client, jobIds) {
+  if (jobIds.length === 0) return;
+  await client.query(
+    `UPDATE http_jobs
+     SET locked_at = NULL
+     WHERE job_id = ANY($1::uuid[])`,
+    [jobIds]
+  );
+}
+
 export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) {
   if (isRecurring) {
     await client.query(

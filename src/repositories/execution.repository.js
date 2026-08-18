@@ -10,6 +10,31 @@ export async function createExecution(client, { jobId, attempt, scheduledFor }) 
   return rows[0];
 }
 
+// Batched version of createExecution for the scheduler's per-tick claim
+// batch. One round-trip for N jobs instead of N round-trips - this is what
+// keeps the claim transaction's lock-hold time roughly constant as batch
+// size grows. `entries` is [{ jobId, attempt, scheduledFor }, ...].
+//
+// Returns rows keyed by job_id (not by array position) - UNNEST-based
+// INSERT...SELECT is not guaranteed to preserve input order, so callers
+// must match results back to jobs by job_id, never by index. Safe here
+// because a single claim batch never contains the same job_id twice.
+export async function createExecutionBatch(client, entries) {
+  if (entries.length === 0) return [];
+  const jobIds = entries.map((e) => e.jobId);
+  const attempts = entries.map((e) => e.attempt);
+  const scheduledFors = entries.map((e) => e.scheduledFor);
+
+  const { rows } = await client.query(
+    `INSERT INTO job_executions (job_id, attempt, status, scheduled_time)
+     SELECT job_id, attempt, 'queued', to_timestamp(scheduled_for::bigint)
+     FROM UNNEST($1::uuid[], $2::int[], $3::bigint[]) AS t(job_id, attempt, scheduled_for)
+     RETURNING execution_id, job_id`,
+    [jobIds, attempts, scheduledFors]
+  );
+  return rows;
+}
+
 export async function markExecutionRunning(executionId) {
   const { rows } = await pool.query(
     `UPDATE job_executions

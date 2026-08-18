@@ -1,9 +1,9 @@
 import { CronExpressionParser } from "cron-parser";
 import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
-import { claimDueJobs, markJobScheduled } from "../repositories/httpJob.repository.js";
-import { createExecution } from "../repositories/execution.repository.js";
-import { createOutboxEntry } from "../repositories/outbox.repository.js";
+import { claimDueJobs, markJobScheduledBatch, releaseJobClaims } from "../repositories/httpJob.repository.js";
+import { createExecutionBatch } from "../repositories/execution.repository.js";
+import { createOutboxEntryBatch } from "../repositories/outbox.repository.js";
 import { publishOutboxEntryNow } from "../outbox/outbox.js";
 import redis from "../config/redis.js";
 
@@ -47,45 +47,92 @@ export async function pollAndScheduleDueJobs() {
     if (claimed.length === 0) {
       await client.query("COMMIT");
       client.release();
-      return;
+      return 0;
     }
 
     logger.info({ count: claimed.length }, "[scheduler] claimed due jobs");
 
     // Claiming, scheduling, AND the outbox write all happen in the SAME
     // transaction now. That matters specifically for ONCE jobs:
-    // markJobScheduled clears next_run as part of this transaction, so if
-    // the process crashes anywhere before COMMIT, the whole batch rolls
-    // back and the job goes right back to being a normal due job on the
-    // next poll - no window where it's claimed (locked_at set) but
-    // next_run is still sitting in the past, which was the root cause of
-    // the double-schedule race this replaces.
+    // markJobScheduledBatch clears next_run as part of this transaction,
+    // so if the process crashes anywhere before COMMIT, the whole batch
+    // rolls back and every job goes right back to being a normal due job
+    // on the next poll - no window where it's claimed (locked_at set) but
+    // next_run is still sitting in the past.
     //
-    // The execution_outbox row (see migration 016) is written in the
-    // same savepoint as the execution row itself, so the two can never
-    // land separately - either both commit or both roll back. That's
-    // what closes the "committed but never LPUSHed" gap: the Redis push
-    // is no longer the thing that has to survive a crash, the outbox row
-    // is, and it's already inside the same transaction as everything
-    // else.
+    // Unlike the old per-job savepoint loop, this does the scheduling and
+    // outbox writes as THREE set-based statements covering the whole
+    // batch, not up to 5xN sequential round-trips. That's what keeps the
+    // claim's row locks (FOR UPDATE SKIP LOCKED, held since claimDueJobs)
+    // from being held for a duration that scales with batch size - a
+    // 100-job batch now costs roughly the same number of round-trips as
+    // a 10-job one.
     //
-    // Each job gets its own SAVEPOINT so one bad job (e.g. malformed
-    // cron_expression) can't roll back the entire batch - it rolls back
-    // only that job's claim, leaving it due again for the next poll,
-    // while every other job in the batch still commits normally.
+    // Because a single set-based INSERT can't skip just the one bad row
+    // the way a per-job savepoint could, validation happens BEFORE any
+    // write: computeNextRunEpoch is called for every claimed job up
+    // front (pure in-memory, no DB round-trip), and jobs that fail it
+    // (e.g. malformed cron_expression) are excluded from the batch
+    // entirely and have their claim released via releaseJobClaims so
+    // they don't get stuck locked forever - they're simply due again,
+    // and will fail loudly in the same way on the next poll until fixed.
+    const validJobs = [];
+    const invalidJobIds = [];
+
     for (const job of claimed) {
-      const savepoint = `job_${job.job_id.replace(/-/g, "_")}`;
       try {
-        await client.query(`SAVEPOINT "${savepoint}"`);
-        const execution = await scheduleOne(client, job);
-        await client.query(`RELEASE SAVEPOINT "${savepoint}"`);
-        toEnqueue.push({ ...job, execution_id: execution.execution_id });
+        const isRecurring = job.schedule_type === "CRON";
+        const nextRun = isRecurring ? computeNextRunEpoch(job) : null;
+        validJobs.push({ job, isRecurring, nextRun });
       } catch (err) {
-        await client.query(`ROLLBACK TO SAVEPOINT "${savepoint}"`);
+        invalidJobIds.push(job.job_id);
         logger.error(
           { err, jobId: job.job_id },
-          "[scheduler] failed to schedule job, skipping"
+          "[scheduler] failed to compute next run, releasing claim"
         );
+      }
+    }
+
+    if (invalidJobIds.length > 0) {
+      await releaseJobClaims(client, invalidJobIds);
+    }
+
+    if (validJobs.length > 0) {
+      const attempt = 1;
+
+      const executionRows = await createExecutionBatch(
+        client,
+        validJobs.map(({ job }) => ({
+          jobId: job.job_id,
+          attempt,
+          scheduledFor: Math.floor(new Date(job.next_run).getTime() / 1000),
+        }))
+      );
+      // Match back by job_id, not array position - UNNEST-based
+      // INSERT...SELECT doesn't guarantee it preserves input order.
+      const executionIdByJobId = new Map(executionRows.map((r) => [r.job_id, r.execution_id]));
+
+      await markJobScheduledBatch(
+        client,
+        validJobs.map(({ job, nextRun, isRecurring }) => ({
+          jobId: job.job_id,
+          nextRun,
+          isRecurring,
+        }))
+      );
+
+      const outboxEntries = validJobs.map(({ job }) => {
+        const executionId = executionIdByJobId.get(job.job_id);
+        return {
+          executionId,
+          queueKey: EXECUTION_QUEUE_KEY,
+          payload: { ...job, execution_id: executionId, attempt },
+        };
+      });
+      await createOutboxEntryBatch(client, outboxEntries);
+
+      for (const { job } of validJobs) {
+        toEnqueue.push({ ...job, execution_id: executionIdByJobId.get(job.job_id) });
       }
     }
 
@@ -94,7 +141,7 @@ export async function pollAndScheduleDueJobs() {
     await client.query("ROLLBACK");
     logger.error({ err }, "[scheduler] failed to claim/schedule due jobs, batch rolled back");
     client.release();
-    return;
+    return 0;
   }
 
   client.release();
@@ -124,29 +171,8 @@ export async function pollAndScheduleDueJobs() {
       );
     }
   }
-}
 
-async function scheduleOne(client, job) {
-  const isRecurring = job.schedule_type === "CRON";
-  const attempt = 1;
-  const scheduledForEpoch = Math.floor(new Date(job.next_run).getTime() / 1000);
-
-  const execution = await createExecution(client, {
-    jobId: job.job_id,
-    attempt,
-    scheduledFor: scheduledForEpoch,
-  });
-
-  const nextRun = isRecurring ? computeNextRunEpoch(job) : null;
-  await markJobScheduled(client, job.job_id, { nextRun, isRecurring });
-
-  await createOutboxEntry(client, {
-    executionId: execution.execution_id,
-    queueKey: EXECUTION_QUEUE_KEY,
-    payload: { ...job, execution_id: execution.execution_id, attempt },
-  });
-
-  return execution;
+  return claimed.length;
 }
 
 export { EXECUTION_QUEUE_KEY };
