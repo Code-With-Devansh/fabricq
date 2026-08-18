@@ -11,6 +11,7 @@ import {
   disableJob,
 } from "../repositories/httpJob.repository.js";
 import { scheduleExecutionRetry } from "../retry/scheduleRetry.js";
+import { classifyFailure } from "../retry/classifyFailure.js";
 import config from "../config/index.js";
 import {
   pushExecutionEvent,
@@ -129,6 +130,7 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: "Redirect loop detected",
+          failureReason: "redirect_loop",
         };
       }
       visitedUrls.add(url);
@@ -150,6 +152,7 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: err instanceof SsrfBlockedError ? err.message : String(err),
+          failureReason: "ssrf_blocked",
         };
       }
 
@@ -178,6 +181,7 @@ async function executeHttpJob(execution) {
             redirectCount: redirects.length,
             redirects,
             error: (err.cause ?? err).message,
+            failureReason: "ssrf_blocked",
           };
         }
         throw err;
@@ -204,6 +208,7 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: `Redirect encountered (${res.status}) but redirect_mode is "error"`,
+          failureReason: "redirect_mode_error",
         };
       }
       const location = res.headers.get("location");
@@ -216,6 +221,7 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: `Redirect response ${res.status} missing Location header`,
+          failureReason: "redirect_missing_location",
         };
       }
 
@@ -247,6 +253,7 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: `Maximum redirect count (${redirect_policy.maxRedirects}) exceeded`,
+          failureReason: "redirect_max_exceeded",
         };
       }
 
@@ -263,6 +270,7 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: `Cross-origin redirect to ${next.origin} is not allowed by this job's redirect policy`,
+          failureReason: "redirect_policy_violation",
         };
       }
 
@@ -281,6 +289,7 @@ async function executeHttpJob(execution) {
           redirects,
           error:
             "HTTPS to HTTP redirect is not allowed by this job's redirect policy",
+          failureReason: "redirect_policy_violation",
         };
       }
 
@@ -353,6 +362,10 @@ async function handleExecution(job) {
   // write left is disabling a ONCE job once it's fully resolved.
   const client = await pool.connect();
   let willRetry = false;
+  // Final status for this execution row, set below in every branch except
+  // the "will retry" one (scheduleExecutionRetry owns the row's status -
+  // retry_wait - in that case, see migration 020).
+  let finalStatus = null;
   try {
     await client.query("BEGIN");
 
@@ -361,24 +374,43 @@ async function handleExecution(job) {
     const exhausted = attempt >= job.max_attempts;
 
     if (result.success) {
+      finalStatus = "success";
       if (!isRecurring) {
         await disableJob(client, job.job_id);
       }
-    } else if (!exhausted) {
-      // Retries now work the same way for ONCE and CRON: a single
-      // triggered execution gets retried in place, independent of the
-      // job's own schedule cursor. See migration 020 / scheduleRetry.js.
-      await scheduleExecutionRetry(client, {
-        executionId: job.execution_id,
-        job,
-        attempt,
-      });
-      willRetry = true;
-    } else if (!isRecurring) {
-      await disableJob(client, job.job_id);
+    } else {
+      // Cause (why it failed) and retryability (whether to try again) are
+      // separate axes - classifyFailure only ever answers the latter.
+      // "permanent" always stops retries regardless of attempts left;
+      // "retryable" still stops once attempts are exhausted, just for a
+      // different reason.
+      const classification = classifyFailure(result);
+
+      if (classification === "permanent") {
+        finalStatus = "failed_permanent";
+        if (!isRecurring) {
+          await disableJob(client, job.job_id);
+        }
+      } else if (!exhausted) {
+        // Retries now work the same way for ONCE and CRON: a single
+        // triggered execution gets retried in place, independent of the
+        // job's own schedule cursor. See migration 020 / scheduleRetry.js.
+        await scheduleExecutionRetry(client, {
+          executionId: job.execution_id,
+          job,
+          attempt,
+        });
+        willRetry = true;
+      } else {
+        finalStatus = "failed_max_retries";
+        if (!isRecurring) {
+          await disableJob(client, job.job_id);
+        }
+      }
     }
-    // CRON, exhausted: nothing to do to http_jobs - the next tick is
-    // already scheduled regardless of this execution's outcome.
+    // CRON, not retrying (permanent or exhausted): nothing further to do
+    // to http_jobs - the next tick is already scheduled regardless of
+    // this execution's outcome.
 
     await client.query("COMMIT");
   } catch (err) {
@@ -402,12 +434,11 @@ async function handleExecution(job) {
   // it to queued and republish it. Only genuinely final outcomes
   // (success, or failure with no retries left) get recorded as such.
   if (!willRetry) {
-    const status = result.success ? "success" : "failed";
-    await recordExecutionStatus(job.execution_id, status);
+    await recordExecutionStatus(job.execution_id, finalStatus);
     await pushExecutionEvent({
       executionId: job.execution_id,
       type: "completed",
-      payload: { ...result, workerId: WORKER_ID },
+      payload: { ...result, status: finalStatus, workerId: WORKER_ID },
     });
   }
 

@@ -50,7 +50,7 @@ export async function completeExecution(
   client,
   executionId,
   {
-    success,
+    status,
     responseStatus = null,
     responseBody = null,
     error = null,
@@ -75,7 +75,7 @@ export async function completeExecution(
      RETURNING *`,
     [
       executionId,
-      success ? "success" : "failed",
+      status,
       responseStatus,
       responseBody === null ? null : JSON.stringify({ body: responseBody }),
       error === null ? null : JSON.stringify({ message: error }),
@@ -121,7 +121,10 @@ export async function completeExecutionsBatch(client, rows) {
 
   for (const r of rows) {
     executionIds.push(r.executionId);
-    statuses.push(r.success ? "success" : "failed");
+    // status is decided by the caller (worker.js's handleExecution /
+    // recovery.js) - success, failed_permanent, or failed_max_retries -
+    // never re-derived here from a boolean.
+    statuses.push(r.status);
     responseStatuses.push(r.responseStatus ?? null);
     responses.push(
       r.responseBody === null || r.responseBody === undefined

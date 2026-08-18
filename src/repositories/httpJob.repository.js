@@ -239,14 +239,21 @@ export async function listJobsForTeam({
   const values = [teamId];
 
   if (status && OUTCOME_STATUSES.has(status)) {
-    values.push(status === "COMPLETED" ? "success" : "failed");
+    // "failed" covers every terminal failure status: the legacy plain
+    // 'failed' value on pre-migration-022 rows, plus the two causes new
+    // rows are written with (see classifyFailure.js / migration 022).
+    const matchingStatuses =
+      status === "COMPLETED"
+        ? ["success"]
+        : ["failed", "failed_permanent", "failed_max_retries"];
+    values.push(matchingStatuses);
     conditions.push(`
       (
         SELECT je.status FROM job_executions je
         WHERE je.job_id = http_jobs.job_id
         ORDER BY je.created_at DESC
         LIMIT 1
-      ) = $${values.length}
+      ) = ANY($${values.length}::execution_status[])
     `);
   }
   if (typeof enabled === "boolean") {
