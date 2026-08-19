@@ -220,7 +220,7 @@ export async function pollAndScheduleDueJobs() {
       // can now own multiple rows in this batch (backfill), all with the
       // same attempt=1, so job_id alone is no longer unique.
       const executionIdByKey = new Map(
-        executionRows.map((r) => [`${r.job_id}:${r.scheduled_for}`, r.execution_id])
+        executionRows.map((r) => [`${r.job_id}:${r.scheduled_for}`, { executionId: r.execution_id, createdAt: r.created_at }])
       );
 
       await markJobScheduledBatch(
@@ -235,13 +235,14 @@ export async function pollAndScheduleDueJobs() {
       const outboxEntries = [];
       for (const { job, ticks } of validJobs) {
         for (const scheduledFor of ticks) {
-          const executionId = executionIdByKey.get(`${job.job_id}:${scheduledFor}`);
+          const { executionId, createdAt } = executionIdByKey.get(`${job.job_id}:${scheduledFor}`);
           outboxEntries.push({
             executionId,
+            executionCreatedAt: createdAt,
             queueKey: EXECUTION_QUEUE_KEY,
-            payload: { ...job, execution_id: executionId, attempt, scheduled_for: scheduledFor },
+            payload: { ...job, execution_id: executionId, created_at: createdAt, attempt, scheduled_for: scheduledFor },
           });
-          toEnqueue.push({ ...job, execution_id: executionId, scheduled_for: scheduledFor });
+          toEnqueue.push({ ...job, execution_id: executionId, created_at: createdAt, scheduled_for: scheduledFor });
         }
       }
       await createOutboxEntryBatch(client, outboxEntries);

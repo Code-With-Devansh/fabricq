@@ -164,11 +164,21 @@
       "name": "create Job",
       "id": "f8c88018-3c1c-4beb-9035-8aaa755f4868",
       "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "fq_live_uZEJ3y2_dhpGjVwtSKlhYEBhyfMIaGT1",
+              "type": "string"
+            }
+          ]
+        },
         "method": "POST",
         "header": [],
         "body": {
           "mode": "raw",
-          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"http://10.65.21.21:8080/redirectCheck/20\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"ONCE\",\r\n    \"redirect_mode\":\"manual\",\r\n    \"redirect_policy\":{\r\n        \"maxRedirects\":20\r\n    },\r\n    \"run_at\": 1783784885\r\n}",
+          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"https://pixel-mart.in/api/health\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"CRON\",\r\n    \"redirect_mode\":\"manual\",\r\n    \"redirect_policy\":{\r\n        \"maxRedirects\":20\r\n    },\r\n    \"cron_expression\":\"* * * * *\",\r\n    \"backfill_on_missed_run\":true\r\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -176,15 +186,15 @@
           }
         },
         "url": {
-          "raw": "http://localhost:3000/jobs/upload",
+          "raw": "http://localhost:3000/v1/jobs",
           "protocol": "http",
           "host": [
             "localhost"
           ],
           "port": "3000",
           "path": [
-            "jobs",
-            "upload"
+            "v1",
+            "jobs"
           ]
         }
       },

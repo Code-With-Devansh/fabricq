@@ -64,12 +64,18 @@ export async function ensureConsumerGroup() {
 // `*` lets Redis assign the entry ID. Kept as a flat field map (not a
 // single JSON blob) so XADD/XREAD stay cheap and debuggable via redis-cli.
 export async function pushExecutionEvent(event) {
-  const { executionId, type, payload } = event;
+  const { executionId, createdAt = null, type, payload } = event;
   await redis.xadd(
     STREAM_KEY,
     "*",
     "execution_id",
     executionId,
+    // job_executions' created_at, carried along purely so the merger can
+    // include it in its batch UPDATE and let Postgres prune to a single
+    // partition instead of probing all of them (see migration 024). Not
+    // this stream entry's own timestamp - that's the "ts" field below.
+    "created_at",
+    createdAt === null ? "" : new Date(createdAt).toISOString(),
     "type", // "running" | "completed"
     type,
     "payload",

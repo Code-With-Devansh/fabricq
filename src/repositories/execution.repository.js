@@ -32,19 +32,28 @@ export async function createExecutionBatch(client, entries) {
     `INSERT INTO job_executions (job_id, attempt, status, scheduled_time)
      SELECT job_id, attempt, 'queued', to_timestamp(scheduled_for::bigint)
      FROM UNNEST($1::uuid[], $2::int[], $3::bigint[]) AS t(job_id, attempt, scheduled_for)
-     RETURNING execution_id, job_id, EXTRACT(EPOCH FROM scheduled_time)::bigint AS scheduled_for`,
+     RETURNING execution_id, job_id, created_at,
+               EXTRACT(EPOCH FROM scheduled_time)::bigint AS scheduled_for`,
     [jobIds, attempts, scheduledFors]
   );
   return rows;
 }
 
-export async function markExecutionRunning(executionId) {
+// createdAt is optional - when the caller has it (worker/merger/retry all
+// carry it now, threaded from execution creation through the queue
+// payload), it's included in WHERE purely so the partitioned table can
+// prune to a single partition's index instead of probing every partition.
+// When it's not available (e.g. an old queue entry from before this was
+// threaded through), the query still works - it just falls back to
+// scanning every partition.
+export async function markExecutionRunning(executionId, createdAt = null) {
   const { rows } = await pool.query(
     `UPDATE job_executions
      SET status = 'running', started_at = now()
      WHERE execution_id = $1
+       AND ($2::timestamptz IS NULL OR created_at = $2)
      RETURNING *`,
-    [executionId]
+    [executionId, createdAt]
   );
   return rows[0];
 }
@@ -52,6 +61,7 @@ export async function markExecutionRunning(executionId) {
 export async function completeExecution(
   client,
   executionId,
+  createdAt,
   {
     status,
     responseStatus = null,
@@ -75,6 +85,7 @@ export async function completeExecution(
          redirect_count = $8,
          redirects = $9::jsonb
      WHERE execution_id = $1
+       AND ($10::timestamptz IS NULL OR created_at = $10)
      RETURNING *`,
     [
       executionId,
@@ -86,6 +97,7 @@ export async function completeExecution(
       redirectOccurred,
       redirectCount,
       JSON.stringify(redirects),
+      createdAt ?? null,
     ]
   );
   return rows[0];
@@ -97,15 +109,22 @@ export async function completeExecution(
 // with a single multi-row statement per flush. Order within each array
 // must line up positionally - callers build these from the same list.
 
-export async function markExecutionsRunningBatch(client, executionIds) {
-  if (executionIds.length === 0) return;
+// entries: [{ executionId, createdAt }, ...]. createdAt may be null for
+// entries whose queue payload predates this field - those rows just miss
+// out on partition pruning for this update, same trade-off as the
+// single-row functions above.
+export async function markExecutionsRunningBatch(client, entries) {
+  if (entries.length === 0) return;
+  const executionIds = entries.map((e) => e.executionId);
+  const createdAts = entries.map((e) => e.createdAt ?? null);
   await client.query(
     `UPDATE job_executions je
      SET status = 'running', started_at = now()
-     FROM (SELECT unnest($1::uuid[]) AS execution_id) x
+     FROM (SELECT * FROM unnest($1::uuid[], $2::timestamptz[]) AS t(execution_id, created_at)) x
      WHERE je.execution_id = x.execution_id
+       AND (x.created_at IS NULL OR je.created_at = x.created_at)
        AND je.status = 'queued'`, // don't clobber a later 'completed' event that flushed first
-    [executionIds]
+    [executionIds, createdAts]
   );
 }
 
@@ -113,6 +132,7 @@ export async function completeExecutionsBatch(client, rows) {
   if (rows.length === 0) return;
 
   const executionIds = [];
+  const createdAts = [];
   const statuses = [];
   const responseStatuses = [];
   const responses = [];
@@ -124,6 +144,7 @@ export async function completeExecutionsBatch(client, rows) {
 
   for (const r of rows) {
     executionIds.push(r.executionId);
+    createdAts.push(r.createdAt ?? null);
     // status is decided by the caller (worker.js's handleExecution /
     // recovery.js) - success, failed_permanent, or failed_max_retries -
     // never re-derived here from a boolean.
@@ -154,14 +175,16 @@ export async function completeExecutionsBatch(client, rows) {
          redirects = x.redirects::jsonb
      FROM (
        SELECT * FROM unnest(
-         $1::uuid[], $2::execution_status[], $3::int[], $4::text[],
-         $5::text[], $6::text[], $7::boolean[], $8::int[], $9::text[]
-       ) AS t(execution_id, status, response_status, response, error,
+         $1::uuid[], $2::timestamptz[], $3::execution_status[], $4::int[], $5::text[],
+         $6::text[], $7::text[], $8::boolean[], $9::int[], $10::text[]
+       ) AS t(execution_id, created_at, status, response_status, response, error,
               worker_id, redirect_occurred, redirect_count, redirects)
      ) x
-     WHERE je.execution_id = x.execution_id`,
+     WHERE je.execution_id = x.execution_id
+       AND (x.created_at IS NULL OR je.created_at = x.created_at)`,
     [
       executionIds,
+      createdAts,
       statuses,
       responseStatuses,
       responses,
@@ -188,15 +211,16 @@ export async function getExecutionById(executionId) {
 // one logical execution, several tries. attempt is bumped here (not by the
 // caller) so it's atomic with the status/retry_at flip - no window where a
 // concurrent reader sees retry_wait with a stale attempt number.
-export async function markExecutionRetryWait(client, executionId, { retryAt }) {
+export async function markExecutionRetryWait(client, executionId, createdAt, { retryAt }) {
   const { rows } = await client.query(
     `UPDATE job_executions
      SET status = 'retry_wait',
          retry_at = $2,
          attempt = attempt + 1
      WHERE execution_id = $1
+       AND ($3::timestamptz IS NULL OR created_at = $3)
      RETURNING *`,
-    [executionId, retryAt]
+    [executionId, retryAt, createdAt ?? null]
   );
   return rows[0] ?? null;
 }

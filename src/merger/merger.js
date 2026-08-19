@@ -30,7 +30,16 @@ function parseEntry([id, fields]) {
   } catch {
     // malformed payload - still ack it below so it doesn't block the group forever
   }
-  return { id, executionId: obj.execution_id, type: obj.type, payload };
+  return {
+    id,
+    executionId: obj.execution_id,
+    // empty string means the producer didn't have it (old entry, or a
+    // path that predates this field) - treated as null downstream so
+    // the batch update just skips pruning for this row.
+    createdAt: obj.created_at ? obj.created_at : null,
+    type: obj.type,
+    payload,
+  };
 }
 
 // Collapse a batch to the LATEST event per execution_id for each event
@@ -64,11 +73,16 @@ async function flush(entries) {
     await client.query("BEGIN");
 
     if (runningByExec.size > 0) {
-      await markExecutionsRunningBatch(client, [...runningByExec.keys()]);
+      const entries = [...runningByExec.values()].map((e) => ({
+        executionId: e.executionId,
+        createdAt: e.createdAt,
+      }));
+      await markExecutionsRunningBatch(client, entries);
     }
     if (completedByExec.size > 0) {
       const rows = [...completedByExec.values()].map((e) => ({
         executionId: e.executionId,
+        createdAt: e.createdAt,
         ...e.payload,
       }));
       await completeExecutionsBatch(client, rows);

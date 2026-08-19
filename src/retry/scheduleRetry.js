@@ -9,8 +9,8 @@ import { markExecutionRetryWait } from "../repositories/execution.repository.js"
 // `attempt` is the attempt number that just failed (1-indexed). The next
 // attempt will be attempt+1, which is what the backoff delay is computed
 // for and what markExecutionRetryWait bumps the row to.
-export async function scheduleExecutionRetry(client, { executionId, job, attempt }) {
+export async function scheduleExecutionRetry(client, { executionId, createdAt = null, job, attempt }) {
   const delaySeconds = computeDelaySeconds(job, attempt + 1);
   const retryAt = new Date(Date.now() + delaySeconds * 1000);
-  return markExecutionRetryWait(client, executionId, { retryAt });
+  return markExecutionRetryWait(client, executionId, createdAt, { retryAt });
 }

@@ -3,11 +3,11 @@ import { pool } from "../config/db.js";
 // Written inside the SAME transaction/savepoint as the execution row it
 // belongs to - see migration 016 for why that matters. `client` must be
 // the transaction client the caller is already inside, never the pool.
-export async function createOutboxEntry(client, { executionId, queueKey, payload }) {
+export async function createOutboxEntry(client, { executionId, executionCreatedAt, queueKey, payload }) {
   await client.query(
-    `INSERT INTO execution_outbox (execution_id, queue_key, payload)
-     VALUES ($1, $2, $3::jsonb)`,
-    [executionId, queueKey, JSON.stringify(payload)]
+    `INSERT INTO execution_outbox (execution_id, execution_created_at, queue_key, payload)
+     VALUES ($1, $2, $3, $4::jsonb)`,
+    [executionId, executionCreatedAt, queueKey, JSON.stringify(payload)]
   );
 }
 
@@ -19,14 +19,16 @@ export async function createOutboxEntry(client, { executionId, queueKey, payload
 export async function createOutboxEntryBatch(client, entries) {
   if (entries.length === 0) return;
   const executionIds = entries.map((e) => e.executionId);
+  const executionCreatedAts = entries.map((e) => e.executionCreatedAt);
   const queueKeys = entries.map((e) => e.queueKey);
   const payloads = entries.map((e) => JSON.stringify(e.payload));
 
   await client.query(
-    `INSERT INTO execution_outbox (execution_id, queue_key, payload)
-     SELECT execution_id, queue_key, payload
-     FROM UNNEST($1::uuid[], $2::text[], $3::jsonb[]) AS t(execution_id, queue_key, payload)`,
-    [executionIds, queueKeys, payloads]
+    `INSERT INTO execution_outbox (execution_id, execution_created_at, queue_key, payload)
+     SELECT execution_id, execution_created_at, queue_key, payload
+     FROM UNNEST($1::uuid[], $2::timestamptz[], $3::text[], $4::jsonb[])
+       AS t(execution_id, execution_created_at, queue_key, payload)`,
+    [executionIds, executionCreatedAts, queueKeys, payloads]
   );
 }
 
@@ -37,17 +39,21 @@ export async function createOutboxEntryBatch(client, entries) {
 // same execution row (see migration 020), so they reuse its outbox row
 // too. created_at resets along with it so the relay's staleAfter window
 // is measured from this requeue, not the original schedule time.
-export async function upsertRetryOutboxEntry(client, { executionId, queueKey, payload }) {
+export async function upsertRetryOutboxEntry(client, { executionId, executionCreatedAt, queueKey, payload }) {
+  // execution_created_at is NOT included in the DO UPDATE SET - it's
+  // immutable per execution (it's the job_executions row's own creation
+  // time, not this outbox row's), so re-asserting it on conflict would be
+  // a no-op at best and a footgun if a caller ever passed the wrong value.
   await client.query(
-    `INSERT INTO execution_outbox (execution_id, queue_key, payload)
-     VALUES ($1, $2, $3::jsonb)
+    `INSERT INTO execution_outbox (execution_id, execution_created_at, queue_key, payload)
+     VALUES ($1, $2, $3, $4::jsonb)
      ON CONFLICT (execution_id) DO UPDATE
      SET queue_key = EXCLUDED.queue_key,
          payload = EXCLUDED.payload,
          published_at = NULL,
          publish_attempts = 0,
          created_at = now()`,
-    [executionId, queueKey, JSON.stringify(payload)]
+    [executionId, executionCreatedAt, queueKey, JSON.stringify(payload)]
   );
 }
 

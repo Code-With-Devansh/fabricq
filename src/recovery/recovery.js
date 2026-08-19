@@ -98,7 +98,7 @@ async function getStalePendingEntries() {
 // http_jobs.next_run/locked_at already advanced independently at claim
 // time (scheduler.js), regardless of how this execution resolves.
 async function rescheduleForRetry(client, executionId, job, attempt) {
-  await scheduleExecutionRetry(client, { executionId, job, attempt });
+  await scheduleExecutionRetry(client, { executionId, createdAt: job.created_at ?? null, job, attempt });
 }
 
 // Handles a single stale execution: decide whether the worker actually
@@ -216,8 +216,12 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
       // failed (it may never have completed one) - always
       // failed_max_retries, never failed_permanent. See classifyFailure.js.
       await recordExecutionStatus(executionId, "failed_max_retries");
+      // `job` may be undefined here if `raw` failed to parse earlier and
+      // we already returned - by this point it's always a parsed object,
+      // just possibly from a payload predating the created_at field.
       await pushExecutionEvent({
         executionId,
+        createdAt: job?.created_at ?? null,
         type: "completed",
         payload: {
           success: false,

@@ -397,6 +397,7 @@ async function handleExecution(job) {
         // job's own schedule cursor. See migration 020 / scheduleRetry.js.
         await scheduleExecutionRetry(client, {
           executionId: job.execution_id,
+          createdAt: job.created_at ?? null,
           job,
           attempt,
         });
@@ -437,6 +438,7 @@ async function handleExecution(job) {
     await recordExecutionStatus(job.execution_id, finalStatus);
     await pushExecutionEvent({
       executionId: job.execution_id,
+      createdAt: job.created_at ?? null,
       type: "completed",
       payload: { ...result, status: finalStatus, workerId: WORKER_ID },
     });
@@ -487,7 +489,7 @@ export async function stopWorker() {
 async function processJob(job, streamId) {
   await Promise.all([
     recordExecutionStatus(job.execution_id, "running"),
-    pushExecutionEvent({ executionId: job.execution_id, type: "running", payload: {} }),
+    pushExecutionEvent({ executionId: job.execution_id, createdAt: job.created_at ?? null, type: "running", payload: {} }),
   ]);
 
   try {

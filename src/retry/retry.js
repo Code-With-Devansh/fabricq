@@ -12,6 +12,7 @@ function buildRetryPayload(row) {
   return {
     job_id: row.hj_job_id,
     execution_id: row.execution_id,
+    created_at: row.created_at,
     attempt: row.attempt,
     schedule_type: row.schedule_type,
     method: row.method,
@@ -62,6 +63,7 @@ export async function runRetrySweep() {
     for (const row of claimed) {
       await upsertRetryOutboxEntry(client, {
         executionId: row.execution_id,
+        executionCreatedAt: row.created_at,
         queueKey: EXECUTION_QUEUE_KEY,
         payload: buildRetryPayload(row),
       });
