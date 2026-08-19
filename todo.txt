@@ -7,14 +7,14 @@ COMMIT
 
 for only this scheduling update, you don't need an explicit transaction. worker.js line 303 const client = await pool.connect();
 
-0.4 not all failures should schedule for retry.
 
-0.45: Is this configurable per-job, or a fixed platform rule? not configurable for deployment configureable on self deployment.
+0.4: retry configuration per-job? not configurable for deployment configureable on self deployment.
 
 0.6 429 special-casing — do you want to honor Retry-After headers when present, overriding your configured backoff strategy for that one attempt? That's a nice-to-have but changes scheduleExecutionRetry's inputs.
 let this configurable if to honor retry after or not.
 
 0.5 job_executions and execution_outbox, redis streams unbounded growth
+
 
 0.6 listJobsForTeam runs the full WHERE twice (data query + separate COUNT(*)) — for large teams this doubles scan cost. Consider COUNT(*) OVER() as a window function in the single query instead of two round trips, or cap/estimate counts for large result sets.
 

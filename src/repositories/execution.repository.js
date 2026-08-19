@@ -15,10 +15,13 @@ export async function createExecution(client, { jobId, attempt, scheduledFor }) 
 // keeps the claim transaction's lock-hold time roughly constant as batch
 // size grows. `entries` is [{ jobId, attempt, scheduledFor }, ...].
 //
-// Returns rows keyed by job_id (not by array position) - UNNEST-based
-// INSERT...SELECT is not guaranteed to preserve input order, so callers
-// must match results back to jobs by job_id, never by index. Safe here
-// because a single claim batch never contains the same job_id twice.
+// Returns rows keyed by (job_id, scheduled_for) - NOT by job_id alone.
+// UNNEST-based INSERT...SELECT is not guaranteed to preserve input order,
+// and a single claim batch can now contain MULTIPLE entries for the same
+// job_id (backfill: one row per missed tick, all attempt=1). job_id alone
+// is no longer a unique match key - callers must match back on the pair
+// (job_id, scheduled_for), which IS unique within a batch since a cron's
+// tick timestamps are strictly increasing.
 export async function createExecutionBatch(client, entries) {
   if (entries.length === 0) return [];
   const jobIds = entries.map((e) => e.jobId);
@@ -29,7 +32,7 @@ export async function createExecutionBatch(client, entries) {
     `INSERT INTO job_executions (job_id, attempt, status, scheduled_time)
      SELECT job_id, attempt, 'queued', to_timestamp(scheduled_for::bigint)
      FROM UNNEST($1::uuid[], $2::int[], $3::bigint[]) AS t(job_id, attempt, scheduled_for)
-     RETURNING execution_id, job_id`,
+     RETURNING execution_id, job_id, EXTRACT(EPOCH FROM scheduled_time)::bigint AS scheduled_for`,
     [jobIds, attempts, scheduledFors]
   );
   return rows;

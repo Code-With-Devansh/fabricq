@@ -80,9 +80,34 @@ export const createJobSchema = z
 
     retry_max_seconds: z.number().int().min(0).optional().default(3600),
 
+    // See migration 023. backfill_on_missed_run only makes sense for CRON
+    // jobs - a ONCE job has exactly one due tick by definition, there's
+    // nothing to "fall behind" on. max_catchup_per_poll is meaningless
+    // without backfill_on_missed_run=true (skip-ahead only ever creates
+    // one execution regardless), so it's rejected unless backfill is on -
+    // better to error loudly than silently ignore a value the caller set.
+    backfill_on_missed_run: z.boolean().optional().default(false),
+
+    max_catchup_per_poll: z.number().int().min(1).max(100).optional(),
+
     enabled: z.boolean().optional().default(true),
   })
   .superRefine((data, ctx) => {
+    if (data.backfill_on_missed_run && data.schedule_type === "ONCE") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["backfill_on_missed_run"],
+        message: "backfill_on_missed_run only applies to CRON jobs.",
+      });
+    }
+
+    if (data.max_catchup_per_poll != null && !data.backfill_on_missed_run) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["max_catchup_per_poll"],
+        message: "max_catchup_per_poll requires backfill_on_missed_run to be true.",
+      });
+    }
     const authResult = authConfigSchema.safeParse({
       auth_type: data.auth_type,
       auth_config: data.auth_config,
@@ -163,6 +188,8 @@ export const updateJobSchema = z
       .optional(),
     retry_multiplier: z.number().positive().optional(),
     retry_max_seconds: z.number().int().min(0).optional(),
+    backfill_on_missed_run: z.boolean().optional(),
+    max_catchup_per_poll: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
   })
   .strict()
@@ -170,6 +197,28 @@ export const updateJobSchema = z
     message: "At least one field must be provided to update.",
   })
   .superRefine((data, ctx) => {
+    // Both checks below only fire on values present IN THIS PARTIAL
+    // UPDATE, not against the job's existing merged state - the service
+    // layer merges with the existing row afterward (see updateJobService)
+    // and doesn't re-run this validation, so a request that only sends
+    // max_catchup_per_poll against a job that already has
+    // backfill_on_missed_run=true is legitimate and shouldn't be rejected
+    // here just because backfill_on_missed_run isn't in THIS payload.
+    if (data.backfill_on_missed_run === true && data.schedule_type === "ONCE") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["backfill_on_missed_run"],
+        message: "backfill_on_missed_run only applies to CRON jobs.",
+      });
+    }
+
+    if (data.max_catchup_per_poll != null && data.backfill_on_missed_run === false) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["max_catchup_per_poll"],
+        message: "max_catchup_per_poll requires backfill_on_missed_run to be true.",
+      });
+    }
     if (data.auth_type != null && data.auth_type !== "NONE") {
       const authResult = authConfigSchema.safeParse({
         auth_type: data.auth_type,

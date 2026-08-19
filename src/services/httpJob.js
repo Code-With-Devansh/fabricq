@@ -54,6 +54,23 @@ export const updateJobService = async (teamId, jobId, updates) => {
 
   const merged = { ...existing, ...updates };
 
+  // The zod schema can only validate what's IN this request; it can't see
+  // that e.g. backfill_on_missed_run=true is being set on a job whose
+  // schedule_type is (still) ONCE when schedule_type itself isn't part of
+  // this PATCH. Re-check against the merged state here.
+  if (merged.backfill_on_missed_run && merged.schedule_type === "ONCE") {
+    throw new AppError(
+      "backfill_on_missed_run only applies to CRON jobs.",
+      400
+    );
+  }
+  if (merged.max_catchup_per_poll != null && !merged.backfill_on_missed_run) {
+    throw new AppError(
+      "max_catchup_per_poll requires backfill_on_missed_run to be true.",
+      400
+    );
+  }
+
   // Recompute next_run if anything schedule-related changed, so the
   // scheduler doesn't keep polling against a stale timestamp.
   const scheduleChanged =

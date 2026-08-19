@@ -24,7 +24,9 @@ export async function createJob(job) {
       retry_strategy,
       retry_multiplier,
       retry_max_seconds,
-      redirect_policy
+      redirect_policy,
+      backfill_on_missed_run,
+      max_catchup_per_poll
     )
     VALUES (
       $1,
@@ -48,7 +50,9 @@ export async function createJob(job) {
       $19,
       $20,
       $21,
-      $22::jsonb
+      $22::jsonb,
+      $23,
+      $24
  )
     RETURNING *;
   `;
@@ -82,6 +86,8 @@ export async function createJob(job) {
         allowHttpDowngrade: false,
       }
     ),
+    job.backfill_on_missed_run ?? false,
+    job.max_catchup_per_poll ?? null,
   ];
 
   const { rows } = await pool.query(query, values);
@@ -154,15 +160,23 @@ export async function markJobScheduledBatch(client, entries) {
 }
 
 // Releases the claim (locked_at) on jobs that were claimed by claimDueJobs
-// but excluded from this tick's batch - e.g. a malformed cron_expression
-// that fails computeNextRunEpoch before any write happens. Without this,
-// a job that fails validation stays claimed forever: claimDueJobs' WHERE
-// clause filters on locked_at IS NULL, and nothing else ever clears it,
-// so the job silently drops out of scheduling until someone notices.
-// next_run is left untouched so the job is still "due" and gets reclaimed
-// (and re-fail, visibly, in the logs) on the very next poll rather than
-// disappearing.
-export async function releaseJobClaims(client, jobIds) {
+// but excluded from this tick's batch. Two distinct reasons land here:
+//   - "invalid_schedule": a malformed cron_expression that fails
+//     computeNextRunEpoch before any write happens.
+//   - "queue_depth_budget": the job's required executions (1 for
+//     skip-ahead, up to max_catchup_per_poll for backfill) didn't fit in
+//     this poll's remaining EXECUTION_QUEUE_KEY budget - not a bad job,
+//     just backpressure. See scheduler.js.
+// Without this, a released-but-never-retried job stays claimed forever:
+// claimDueJobs' WHERE clause filters on locked_at IS NULL, and nothing
+// else ever clears it, so the job silently drops out of scheduling until
+// someone notices. next_run is left untouched (invalid_schedule case) or
+// deliberately unadvanced (queue_depth_budget case) so the job is still
+// "due" and gets reclaimed on the very next poll rather than disappearing.
+// `reason` is accepted purely for structured logging by the caller - it's
+// not persisted, since locked_at has no room for it and there's no
+// standing need to query "why was this released" after the fact.
+export async function releaseJobClaims(client, jobIds, reason = "unspecified") {
   if (jobIds.length === 0) return;
   await client.query(
     `UPDATE http_jobs
@@ -170,6 +184,7 @@ export async function releaseJobClaims(client, jobIds) {
      WHERE job_id = ANY($1::uuid[])`,
     [jobIds]
   );
+  return { jobIds, reason };
 }
 
 export async function markJobScheduled(client, jobId, { nextRun, isRecurring }) {
@@ -308,6 +323,8 @@ export async function updateJobForTeam(teamId, jobId, fields) {
     "retry_strategy",
     "retry_multiplier",
     "retry_max_seconds",
+    "backfill_on_missed_run",
+    "max_catchup_per_poll",
     // redirect_policy intentionally excluded from this list - it's jsonb
     // and needs a merge (||), not a plain overwrite, so it's handled
     // separately below.
