@@ -169,7 +169,7 @@
           "bearer": [
             {
               "key": "token",
-              "value": "fq_live_uZEJ3y2_dhpGjVwtSKlhYEBhyfMIaGT1",
+              "value": "fq_live_9WFtPsgUudiF9sve2D6KwTJi44hrGFHH",
               "type": "string"
             }
           ]
@@ -178,7 +178,7 @@
         "header": [],
         "body": {
           "mode": "raw",
-          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"https://pixel-mart.in/api/health\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"CRON\",\r\n    \"redirect_mode\":\"manual\",\r\n    \"redirect_policy\":{\r\n        \"maxRedirects\":20\r\n    },\r\n    \"cron_expression\":\"* * * * *\",\r\n    \"backfill_on_missed_run\":true\r\n}",
+          "raw": "{\r\n    \"method\": \"GET\",\r\n    \"url\": \"https://pixel-mart.in/sih\",\r\n    \"body\": {},\r\n    \"headers\": {},\r\n    \"schedule_type\": \"CRON\",\r\n    \"redirect_mode\":\"manual\",\r\n    \"redirect_policy\":{\r\n        \"maxRedirects\":20\r\n    },\r\n    \"cron_expression\":\"* * * * *\",\r\n    \"backfill_on_missed_run\":true\r\n}",
           "options": {
             "raw": {
               "language": "json"
