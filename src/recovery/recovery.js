@@ -215,7 +215,7 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
       // Operational give-up, not a classification of *why* the HTTP call
       // failed (it may never have completed one) - always
       // failed_max_retries, never failed_permanent. See classifyFailure.js.
-      await recordExecutionStatus(executionId, "failed_max_retries");
+      await recordExecutionStatus(executionId, "failed_max_retries", { final: true });
       // `job` may be undefined here if `raw` failed to parse earlier and
       // we already returned - by this point it's always a parsed object,
       // just possibly from a payload predating the created_at field.
@@ -271,7 +271,7 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
       // Abandoned with no attempts left - same reasoning as the
       // delivery-count branch above: this is exhaustion, not a
       // classification of the failure cause, so always failed_max_retries.
-      await recordExecutionStatus(executionId, "failed_max_retries");
+      await recordExecutionStatus(executionId, "failed_max_retries", { final: true });
       await pushExecutionEvent({
         executionId,
         type: "completed",

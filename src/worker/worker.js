@@ -74,6 +74,12 @@ function buildAuthHeaders(execution) {
   }
 }
 
+function buildIdempotencyHeader(execution) {
+  return {
+    "X-FabricQ-Idempotency-Key": `${execution.execution_id}:${execution.attempt}`,
+  };
+}
+
 function buildRequestBody(execution) {
   const body = execution.body ?? {};
   if (execution.body_type === "form") {
@@ -159,6 +165,10 @@ async function executeHttpJob(execution) {
       let headers = {
         ...buildAuthHeaders(execution),
         ...(execution.headers ?? {}),
+        // Deliberately last: this is an internal correctness mechanism,
+        // not a user-configurable header, so a same-named header on the
+        // job definition must not be able to silently clobber it.
+        ...buildIdempotencyHeader(execution),
       };
 
       let res;
@@ -435,7 +445,7 @@ async function handleExecution(job) {
   // it to queued and republish it. Only genuinely final outcomes
   // (success, or failure with no retries left) get recorded as such.
   if (!willRetry) {
-    await recordExecutionStatus(job.execution_id, finalStatus);
+    await recordExecutionStatus(job.execution_id, finalStatus, { final: true });
     await pushExecutionEvent({
       executionId: job.execution_id,
       createdAt: job.created_at ?? null,
@@ -488,7 +498,7 @@ export async function stopWorker() {
 // "job popped" and "ownership recorded" for recovery to fall back on.
 async function processJob(job, streamId) {
   await Promise.all([
-    recordExecutionStatus(job.execution_id, "running"),
+    recordExecutionStatus(job.execution_id, "running", { final: false }),
     pushExecutionEvent({ executionId: job.execution_id, createdAt: job.created_at ?? null, type: "running", payload: {} }),
   ]);
 

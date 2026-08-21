@@ -13,22 +13,32 @@ export const GROUP_NAME = "execution-merger";
 // Fast, synchronous, cheap: worker/recovery HSET this right after deciding
 // an execution's outcome, BEFORE handing the detail off to the stream.
 // This is what recovery.js checks instead of reading job_executions from
-// Postgres, so recovery never races the merger's batch flush. TTL keeps
-// it from growing unbounded - once the merger has actually flushed to
-// Postgres (a few hundred ms later, worst case a few seconds under
-// backlog), Postgres is authoritative again and this entry is disposable.
+// Postgres, so recovery never races the merger's batch flush.
+//
+// TTL is per-field (HEXPIRE, Redis 7.4+/8), not per-key. A key-level EXPIRE
+// here would get pushed forward by every write to any execution's field
+// under continuous load, so the hash would never actually expire - the
+// same unbounded-growth problem this key exists to avoid. Per-field TTL
+// means each executionId's entry expires on its own clock regardless of
+// what else is being written to the hash.
+//
+// Every write (including the non-final "running" write) gets an HEXPIRE so
+// nothing is ever unbounded even transiently - e.g. a worker crashing
+// between the "running" write and the final write still has a bounded
+// entry. `final` writes just mark intent for callers; both paths currently
+// carry the same TTL.
 const STATUS_HASH_KEY = "fabricq:execution:status";
 const STATUS_TTL_SECONDS = 60 * 60;
 
-export async function recordExecutionStatus(executionId, status) {
+export async function recordExecutionStatus(executionId, status, { final = false } = {}) {
   try {
     await redis
       .multi()
       .hset(STATUS_HASH_KEY, executionId, status)
-      .expire(STATUS_HASH_KEY, STATUS_TTL_SECONDS)
+      .hexpire(STATUS_HASH_KEY, STATUS_TTL_SECONDS, "FIELDS", 1, executionId)
       .exec();
   } catch (err) {
-    logger.warn({ err, executionId, status }, "[execution-results] failed to record fast-path status");
+    logger.warn({ err, executionId, status, final }, "[execution-results] failed to record fast-path status");
   }
 }
 

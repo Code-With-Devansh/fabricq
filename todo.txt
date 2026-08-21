@@ -1,3 +1,21 @@
+1. fabricq:execution:status TTL is applied to the whole hash, not per-field. recordExecutionStatus calls EXPIRE on every write. Under continuous load, that TTL gets pushed forward on every single execution, so the hash effectively never expires — the exact unbounded-growth problem this key was supposed to avoid. This needs HEXPIRE (Redis 7.4+) on the individual field, not EXPIRE on the hash. This matches what's still on your to-do list, but worth naming explicitly as a functional bug, not just a nice-to-have.
+
+2. fabricq:execution-results stream has no MAXLEN. The execution queue stream (fabricq:executions) trims via XADD ... MAXLEN ~, but the results stream that pushExecutionEvent writes to does not. If the merger ever falls behind, this stream grows unbounded — same class of bug as the one you already caught and fixed for the queue.
+
+3. Minor: package.json has "test": "echo ... && exit 1" — zero test coverage, no CI config, no lint/prettier config anywhere in the repo. For a system this architecturally sophisticated (partitioning, outbox, streams, SSRF), the complete absence of tests is the biggest gap between "impressive design" and "production-ready."
+
+4. Minor: no README — for a portfolio piece, that's actually costing you, since none of this careful design work is visible unless someone reads the code.
+
+5. One thing worth simplifying: the per-execution Redis lock (acquireLock/releaseLock via SET NX) is redundant with XCLAIM in the periodic-sweep path. XCLAIM's min-idle-time check is already atomic at the Redis level — two recovery processes racing on the same stale entry will have exactly one XCLAIM succeed. The lock only earns its keep in the skipFreshnessCheck path (worker's own fast-path call, which bypasses XCLAIM entirely), so it's not dead code, but it's providing safety for one call site while adding two Redis round trips to every call. You could drop the lock from the periodic-sweep path and keep it only for the fast-path call, or just accept the extra round trips as cheap insurance — not urgent, but worth noting since you asked for the "best possible way."
+
+6. The one real design gap: no HTTP-level idempotency key
+
+This is the most consequential thing I'd change. The pipeline guarantees at-least-once execution, not exactly-once: if a worker fires the outbound HTTP request and then crashes before writing success/recordExecutionStatus, recovery will correctly reschedule the execution — and the downstream endpoint gets called a second time. That's inherent to any at-least-once queue talking to an external HTTP service, and it's fine as a documented guarantee, but nothing currently helps the receiver dedupe. Right now buildAuthHeaders/buildRequestBody never inject anything like an Idempotency-Key header. Adding X-FabricQ-Idempotency-Key: {execution_id}:{attempt} (or just {execution_id} if you want retries of the same execution to collapse) as a standard outgoing header costs nothing and lets any downstream that supports idempotency keys (Stripe-style) dedupe your at-least-once delivery for free. Worth adding as a first-class feature, not just a footnote.
+
+7. fabricq:execution-results stream still has no MAXLEN (raised earlier) — this is the last unbounded-growth spot in the pipeline; everything else (outbox, execution queue, status hash-in-theory) accounts for it.
+
+8. Retry sweep and scheduler poll are structurally identical but not unified. runRetrySweep and pollAndScheduleDueJobs both do claim → outbox write → fast-publish-then-relay in the same shape, duplicated across two files. Not wrong, but a shared claimAndPublish(claimFn, buildPayloadFn) helper would remove ~40 lines of duplicated transaction/publish boilerplate and reduce the surface where the two could drift apart (e.g. one gets a bugfix the other doesn't).
+
 0.1 all the query's that fetch some data uses limit and offset based pagination.
 0.2 If your worker currently does:
 
@@ -12,9 +30,6 @@ for only this scheduling update, you don't need an explicit transaction. worker.
 
 0.6 429 special-casing — do you want to honor Retry-After headers when present, overriding your configured backoff strategy for that one attempt? That's a nice-to-have but changes scheduleExecutionRetry's inputs.
 let this configurable if to honor retry after or not.
-
-0.5 job_executions and execution_outbox, redis streams unbounded growth
-
 
 0.6 listJobsForTeam runs the full WHERE twice (data query + separate COUNT(*)) — for large teams this doubles scan cost. Consider COUNT(*) OVER() as a window function in the single query instead of two round trips, or cap/estimate counts for large result sets.
 
