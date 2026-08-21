@@ -34,6 +34,7 @@ import {
   revokeInvitation as revokeInvitationRow,
 } from "../repositories/invitation.repository.js";
 import { canManageMembership } from "../utils/roleHierarchy.js";
+import { invalidateTeamContextCache } from "../cache/teamContextCache.js";
 import { generateInviteToken, hashToken } from "../utils/tokens.js";
 import { findUserById } from "../repositories/auth.repository.js";
 import { enqueueInvitationEmail } from "../queues/mail.queue.js";
@@ -184,6 +185,10 @@ export async function updateMemberRoleService({
       roleId: newRoleId,
     });
     await client.query("COMMIT");
+    // Role changed - drop the cached permission set so the demotion/
+    // promotion takes effect on this member's very next request instead
+    // of waiting out the TTL.
+    await invalidateTeamContextCache(teamId, targetUserId);
     return updated;
   } catch (err) {
     await client.query("ROLLBACK");
@@ -224,6 +229,9 @@ export async function removeMemberService({ teamId, targetUserId, actor }) {
     await client.query("BEGIN");
     await deleteMembership(client, targetMembership.id);
     await client.query("COMMIT");
+    // Removed member shouldn't keep passing loadTeamContext off a stale
+    // cache entry for up to the TTL - drop it immediately.
+    await invalidateTeamContextCache(teamId, targetUserId);
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -423,6 +431,10 @@ export async function acceptInvitationService({ token, userId }) {
       userId,
     });
     await client.query("COMMIT");
+    // Clears any cached "not found" from a prior request against this
+    // team (e.g. the invite preview page, or a stray dashboard call)
+    // made before the membership existed.
+    await invalidateTeamContextCache(invitation.team_id, userId);
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

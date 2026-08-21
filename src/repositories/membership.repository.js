@@ -11,14 +11,26 @@ export async function createMembership(client, { teamId, userId, roleId }) {
 }
 
 // Joins in the role name + is_system flag, which every permission/
-// hierarchy check needs alongside the raw role_id.
+// hierarchy check needs alongside the raw role_id, plus the role's
+// permission keys (LEFT JOIN + ARRAY_AGG) so loadTeamContext gets
+// membership + permissions in one round trip instead of two. Callers
+// that don't care about permission_keys (updateMemberRoleService,
+// removeMemberService, the invite-dedupe check) just ignore the extra
+// field - cheap enough (one indexed join) not to warrant a second,
+// narrower query.
 export async function findMembership(teamId, userId) {
   const { rows } = await pool.query(
     `SELECT tm.id, tm.team_id, tm.user_id, tm.role_id,
-            r.name AS role_name, r.is_system AS role_is_system
+            r.name AS role_name, r.is_system AS role_is_system,
+            COALESCE(
+              ARRAY_AGG(rp.permission_key) FILTER (WHERE rp.permission_key IS NOT NULL),
+              '{}'
+            ) AS permission_keys
      FROM team_memberships tm
      JOIN roles r ON r.id = tm.role_id
-     WHERE tm.team_id = $1 AND tm.user_id = $2`,
+     LEFT JOIN role_permissions rp ON rp.role_id = tm.role_id
+     WHERE tm.team_id = $1 AND tm.user_id = $2
+     GROUP BY tm.id, tm.team_id, tm.user_id, tm.role_id, r.name, r.is_system`,
     [teamId, userId]
   );
   return rows[0] ?? null;

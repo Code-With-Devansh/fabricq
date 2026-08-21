@@ -16,12 +16,30 @@ import {
   getExecutionStatus,
 } from "../streams/executionResults.js";
 
-// Same value the worker uses to decide an execution has gone dark - now
-// it's purely a min-idle-time threshold for XPENDING/XCLAIM rather than a
-// separate heartbeat zset the worker had to maintain itself. An entry
-// sitting unacked in the group's PEL for longer than this, with no
-// activity, is presumed abandoned.
-const STALE_IDLE_MS = 30_000;
+// Staleness is judged per-entry against that job's own timeout_ms, not a
+// single global constant - jobs are allowed to legitimately run up to the
+// timeout_ms validator's max (120s per worker_process.js), and a worker
+// never touches its PEL entry again after XREADGROUP until it XACKs, so a
+// fixed threshold shorter than a job's own timeout would reclaim entries
+// that are still genuinely in flight. Two constants instead:
+//
+// SCAN_FLOOR_IDLE_MS: the IDLE filter passed to XPENDING itself, just to
+// keep the initial scan cheap (skip entries that can't possibly be stale
+// yet under any job's timeout). The real per-entry decision happens in
+// runRecoveryCycle() once each candidate's own timeout_ms is known.
+const SCAN_FLOOR_IDLE_MS = 10_000;
+// RECOVERY_SAFETY_MARGIN_MS: headroom added on top of a job's own
+// timeout_ms before recovery will treat it as abandoned - covers the gap
+// between the worker's AbortController firing and it finishing the
+// Postgres transaction + write-behind status/event calls in
+// handleExecution, so a worker that's still legitimately wrapping up
+// can't lose the race to recovery.
+const RECOVERY_SAFETY_MARGIN_MS = 15_000;
+// Fallback when a payload predates timeout_ms or omits it - must match
+// worker.js's DEFAULT_HTTP_TIMEOUT_MS. Duplicated rather than imported:
+// worker.js already imports recoverExecution from this module, so
+// importing back would be circular.
+const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const CLAIM_BATCH_SIZE = 100;
 
 // Identity this process claims entries under. Distinct from any worker's
@@ -70,19 +88,20 @@ function extractPayload(fields) {
   return null;
 }
 
-// Lists PEL entries idle longer than STALE_IDLE_MS. This is the direct
-// replacement for the old heartbeat zset scan - XPENDING already tracks
-// per-entry idle time and delivery count natively, so there's no separate
-// bookkeeping structure for a worker to maintain (and no crash window
-// between "job claimed" and "bookkeeping written", since the claim IS the
-// bookkeeping).
+// Lists PEL entries idle longer than SCAN_FLOOR_IDLE_MS - a broad first
+// pass, cheap because XPENDING already tracks per-entry idle time and
+// delivery count natively (no separate bookkeeping structure for a worker
+// to maintain, no crash window between "job claimed" and "bookkeeping
+// written"). Candidates returned here still need to be checked against
+// their own job's timeout_ms in runRecoveryCycle() before being treated
+// as genuinely stale.
 async function getStalePendingEntries() {
   // [id, consumer, idleMs, deliveryCount][]
   const entries = await redis.xpending(
     EXECUTION_QUEUE_KEY,
     EXECUTION_QUEUE_GROUP,
     "IDLE",
-    STALE_IDLE_MS,
+    SCAN_FLOOR_IDLE_MS,
     "-",
     "+",
     CLAIM_BATCH_SIZE,
@@ -116,7 +135,17 @@ async function rescheduleForRetry(client, executionId, job, attempt) {
 // goes stale would just add latency for no additional safety. The
 // periodic sweep in runRecoveryCycle() never sets this - it always
 // re-claims via XCLAIM, whose min-idle-time check IS the re-check.
-async function recoverExecution(executionId, streamId, { skipFreshnessCheck = false } = {}) {
+// minIdleMs: the min-idle-time gate passed to XCLAIM on the periodic-sweep
+// path. This is a concurrency guard, not the staleness decision itself -
+// the caller (runRecoveryCycle) has already decided this entry's idle
+// time clears its own job's timeout_ms + RECOVERY_SAFETY_MARGIN_MS before
+// ever calling in here. Defaults to the pre-fix constant's value only for
+// callers that don't have a job-specific figure on hand yet.
+async function recoverExecution(
+  executionId,
+  streamId,
+  { skipFreshnessCheck = false, minIdleMs = DEFAULT_HTTP_TIMEOUT_MS } = {},
+) {
   // The lock only earns its keep on the fast-path call: skipFreshnessCheck
   // means the caller is trusting its own ownership of the entry with no
   // re-check against Redis, so nothing else guards against two calls
@@ -149,7 +178,7 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
     } else {
       // XCLAIM's min-idle-time gate IS the concurrency guard here - if
       // another worker or recovery run touched this entry more recently
-      // than STALE_IDLE_MS ago, the claim below simply returns nothing and
+      // than minIdleMs ago, the claim below simply returns nothing and
       // we back off, exactly like re-checking a heartbeat (or a
       // Redis-level lock) used to, but atomically and for free as part of
       // the claim itself.
@@ -157,7 +186,7 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
         EXECUTION_QUEUE_KEY,
         EXECUTION_QUEUE_GROUP,
         RECOVERY_CONSUMER,
-        STALE_IDLE_MS,
+        minIdleMs,
         streamId,
       );
       if (claimed.length === 0) {
@@ -319,16 +348,16 @@ export async function runRecoveryCycle() {
 
   logger.info({ count: staleEntries.length }, "[recovery] found stale pending entries");
 
-  for (const [streamId, , , deliveryCountRaw] of staleEntries) {
+  for (const [streamId, , idleMsRaw, deliveryCountRaw] of staleEntries) {
     try {
-      // We don't have execution_id without reading the payload first, and
-      // recoverExecution itself will XCLAIM to read it - so resolve
-      // execution_id via a cheap XRANGE first (no claim side effects).
-      // recoverExecution needs it up front regardless of locking (it's
-      // used for the status-hash lookup before any claim happens); the
-      // sweep path no longer takes a Redis lock on it, since XCLAIM's
-      // own min-idle-time check already serializes concurrent recovery
-      // attempts on the same entry.
+      // We don't have execution_id (or timeout_ms) without reading the
+      // payload first, and recoverExecution itself will XCLAIM to read it
+      // - so resolve them via a cheap XRANGE first (no claim side
+      // effects). recoverExecution needs execution_id up front regardless
+      // of locking (it's used for the status-hash lookup before any claim
+      // happens); the sweep path no longer takes a Redis lock on it,
+      // since XCLAIM's own min-idle-time check already serializes
+      // concurrent recovery attempts on the same entry.
       const range = await redis.xrange(EXECUTION_QUEUE_KEY, streamId, streamId);
       if (range.length === 0) continue; // acked/trimmed between XPENDING and now
       const raw = extractPayload(range[0][1]);
@@ -337,8 +366,24 @@ export async function runRecoveryCycle() {
         await redis.xack(EXECUTION_QUEUE_KEY, EXECUTION_QUEUE_GROUP, streamId);
         continue;
       }
-      const { execution_id: executionId } = JSON.parse(raw);
-      await recoverExecution(executionId, streamId);
+      const { execution_id: executionId, timeout_ms: timeoutMs } = JSON.parse(raw);
+
+      // Staleness is relative to *this* job's own timeout, not the scan
+      // floor above - a job legitimately still running (worker's own
+      // AbortController hasn't even fired yet, let alone finished writing
+      // back) must not be reclaimed out from under it. See the
+      // RECOVERY_SAFETY_MARGIN_MS comment near the top of this file.
+      const staleThresholdMs = (timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS) + RECOVERY_SAFETY_MARGIN_MS;
+      const idleMs = Number(idleMsRaw) || 0;
+      if (idleMs < staleThresholdMs) {
+        logger.debug(
+          { executionId, streamId, idleMs, staleThresholdMs },
+          "[recovery] entry idle but still within its own job's timeout budget, skipping this cycle",
+        );
+        continue;
+      }
+
+      await recoverExecution(executionId, streamId, { minIdleMs: staleThresholdMs });
     } catch (err) {
       logger.error({ err, streamId, deliveryCount: deliveryCountRaw }, "[recovery] unexpected error recovering entry");
     }
