@@ -117,8 +117,17 @@ async function rescheduleForRetry(client, executionId, job, attempt) {
 // periodic sweep in runRecoveryCycle() never sets this - it always
 // re-claims via XCLAIM, whose min-idle-time check IS the re-check.
 async function recoverExecution(executionId, streamId, { skipFreshnessCheck = false } = {}) {
-  const token = await acquireLock(executionId);
-  if (!token) {
+  // The lock only earns its keep on the fast-path call: skipFreshnessCheck
+  // means the caller is trusting its own ownership of the entry with no
+  // re-check against Redis, so nothing else guards against two calls
+  // racing on the same executionId (e.g. worker's crash-handling path
+  // firing twice). On the periodic-sweep path, XCLAIM's min-idle-time
+  // check is already atomic at the Redis level - two recovery processes
+  // racing on the same stale entry will have exactly one XCLAIM succeed,
+  // so a second application-level lock there is redundant: two extra
+  // round trips per swept entry for safety XCLAIM already provides.
+  const token = skipFreshnessCheck ? await acquireLock(executionId) : null;
+  if (skipFreshnessCheck && !token) {
     logger.debug({ executionId }, "[recovery] lock held by another recovery run, skipping");
     return;
   }
@@ -138,10 +147,12 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
       }
       raw = extractPayload(range[0][1]);
     } else {
-      // Re-check via XCLAIM's own min-idle-time gate - if another
-      // worker or recovery run touched this entry more recently than
-      // STALE_IDLE_MS ago, the claim below simply returns nothing and we
-      // back off, exactly like re-checking a heartbeat used to.
+      // XCLAIM's min-idle-time gate IS the concurrency guard here - if
+      // another worker or recovery run touched this entry more recently
+      // than STALE_IDLE_MS ago, the claim below simply returns nothing and
+      // we back off, exactly like re-checking a heartbeat (or a
+      // Redis-level lock) used to, but atomically and for free as part of
+      // the claim itself.
       const claimed = await redis.xclaim(
         EXECUTION_QUEUE_KEY,
         EXECUTION_QUEUE_GROUP,
@@ -291,7 +302,10 @@ async function recoverExecution(executionId, streamId, { skipFreshnessCheck = fa
       "[recovery] recovered abandoned execution",
     );
   } finally {
-    await releaseLock(executionId, token);
+    // token is only ever set on the skipFreshnessCheck (fast-path) branch;
+    // releaseLock is a harmless no-op if called with a null token, but
+    // skip it outright on the sweep path to avoid the wasted round trip.
+    if (token) await releaseLock(executionId, token);
   }
 }
 
@@ -308,12 +322,13 @@ export async function runRecoveryCycle() {
   for (const [streamId, , , deliveryCountRaw] of staleEntries) {
     try {
       // We don't have execution_id without reading the payload first, and
-      // recoverExecution itself will XCLAIM to read it - so pass a
-      // placeholder for logging and let recoverExecution resolve the real
-      // id off the payload once it has claimed the entry. To keep the
-      // lock keyed correctly, resolve execution_id via a cheap XRANGE
-      // first (no claim side effects) before taking the per-execution
-      // lock.
+      // recoverExecution itself will XCLAIM to read it - so resolve
+      // execution_id via a cheap XRANGE first (no claim side effects).
+      // recoverExecution needs it up front regardless of locking (it's
+      // used for the status-hash lookup before any claim happens); the
+      // sweep path no longer takes a Redis lock on it, since XCLAIM's
+      // own min-idle-time check already serializes concurrent recovery
+      // attempts on the same entry.
       const range = await redis.xrange(EXECUTION_QUEUE_KEY, streamId, streamId);
       if (range.length === 0) continue; // acked/trimmed between XPENDING and now
       const raw = extractPayload(range[0][1]);
