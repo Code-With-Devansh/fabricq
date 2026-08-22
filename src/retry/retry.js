@@ -1,9 +1,8 @@
-import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
 import { EXECUTION_QUEUE_KEY } from "../scheduler/scheduler.js";
 import { claimDueRetries } from "../repositories/execution.repository.js";
 import { upsertRetryOutboxEntry } from "../repositories/outbox.repository.js";
-import { publishOutboxEntryNow } from "../outbox/outbox.js";
+import { runInClaimTransaction, publishClaimedBatch } from "../outbox/claimAndPublish.js";
 
 // Reconstructs the same shape worker.js's handleExecution expects (the
 // http_jobs fields it needs to actually re-run the call, plus
@@ -41,70 +40,50 @@ function buildRetryPayload(row) {
 // the same SKIP LOCKED claim pattern as the scheduler's claimDueJobs, and
 // republishes each one through the normal outbox path so the worker picks
 // it up with no retry-specific handling of its own.
+//
+// Transaction wrapper and fast-publish loop are shared with the scheduler
+// poll - see claimAndPublish.js.
 export async function runRetrySweep() {
-  const client = await pool.connect();
-  let claimed = [];
+  const claimed = await runInClaimTransaction(
+    "retry",
+    async (client) => {
+      const claimed = await claimDueRetries(client);
+      if (claimed.length === 0) return [];
 
-  try {
-    await client.query("BEGIN");
-    claimed = await claimDueRetries(client);
+      logger.info({ count: claimed.length }, "[retry] claimed due retries");
 
-    if (claimed.length === 0) {
-      await client.query("COMMIT");
-      client.release();
-      return;
-    }
+      // upsertRetryOutboxEntry writes inside this SAME transaction, so a
+      // crash between here and COMMIT rolls the claim back too - the row
+      // just goes back to retry_wait and gets picked up on the next sweep,
+      // never "claimed but never republished".
+      for (const row of claimed) {
+        await upsertRetryOutboxEntry(client, {
+          executionId: row.execution_id,
+          executionCreatedAt: row.created_at,
+          queueKey: EXECUTION_QUEUE_KEY,
+          payload: buildRetryPayload(row),
+        });
+      }
 
-    logger.info({ count: claimed.length }, "[retry] claimed due retries");
+      return claimed;
+    },
+    []
+  );
 
-    // upsertRetryOutboxEntry writes inside this SAME transaction, so a
-    // crash between here and COMMIT rolls the claim back too - the row
-    // just goes back to retry_wait and gets picked up on the next sweep,
-    // never "claimed but never republished".
-    for (const row of claimed) {
-      await upsertRetryOutboxEntry(client, {
-        executionId: row.execution_id,
-        executionCreatedAt: row.created_at,
-        queueKey: EXECUTION_QUEUE_KEY,
-        payload: buildRetryPayload(row),
-      });
-    }
-
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    logger.error({ err }, "[retry] failed to claim/requeue due retries, batch rolled back");
-    client.release();
-    return;
-  }
-
-  client.release();
-
-  // Same fast-path-then-relay-backstop shape as the scheduler: publish
-  // immediately for low latency, but if this fails or the process dies
-  // right here, the outbox row is already durable and the relay sweep
-  // will publish it on its next tick - nothing is lost.
-  for (const row of claimed) {
-    try {
+  await publishClaimedBatch(
+    "retry",
+    claimed,
+    (row) => ({
       // Per-attempt dedupe key (see outbox.js) - this execution_id was
       // already published once for its previous attempt, so reusing the
       // bare execution_id as the dedupe key would make this republish a
       // silent no-op.
-      const published = await publishOutboxEntryNow({
-        executionId: row.execution_id,
-        queueKey: EXECUTION_QUEUE_KEY,
-        dedupeKey: `${row.execution_id}:${row.attempt}`,
-        payload: buildRetryPayload(row),
-      });
-      logger.info(
-        { executionId: row.execution_id, attempt: row.attempt, published },
-        published ? "[retry] retry requeued" : "[retry] retry requeued, deferred to outbox relay",
-      );
-    } catch (err) {
-      logger.error(
-        { err, executionId: row.execution_id },
-        "[retry] fast-path publish failed, retry left for outbox relay",
-      );
-    }
-  }
+      executionId: row.execution_id,
+      queueKey: EXECUTION_QUEUE_KEY,
+      dedupeKey: `${row.execution_id}:${row.attempt}`,
+      payload: buildRetryPayload(row),
+    }),
+    (row) => ({ executionId: row.execution_id, attempt: row.attempt }),
+    { itemLabel: "retry", verb: "requeued" }
+  );
 }

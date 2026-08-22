@@ -1,10 +1,9 @@
 import { CronExpressionParser } from "cron-parser";
-import { pool } from "../config/db.js";
 import logger from "../config/logger/index.js";
 import { claimDueJobs, markJobScheduledBatch, releaseJobClaims } from "../repositories/httpJob.repository.js";
 import { createExecutionBatch } from "../repositories/execution.repository.js";
 import { createOutboxEntryBatch } from "../repositories/outbox.repository.js";
-import { publishOutboxEntryNow } from "../outbox/outbox.js";
+import { runInClaimTransaction, publishClaimedBatch } from "../outbox/claimAndPublish.js";
 import redis from "../config/redis.js";
 
 const EXECUTION_QUEUE_KEY = "fabricq:executions";
@@ -124,167 +123,142 @@ function computeJobSchedule(job, nowEpoch) {
 }
 
 export async function pollAndScheduleDueJobs() {
-  const client = await pool.connect();
-  let claimed = [];
-  const toEnqueue = [];
+  const { claimedCount, toEnqueue } = await runInClaimTransaction(
+    "scheduler",
+    async (client) => {
+      const claimed = await claimDueJobs(client);
 
-  try {
-    await client.query("BEGIN");
+      if (claimed.length === 0) return { claimedCount: 0, toEnqueue: [] };
 
-    claimed = await claimDueJobs(client);
+      logger.info({ count: claimed.length }, "[scheduler] claimed due jobs");
 
-    if (claimed.length === 0) {
-      await client.query("COMMIT");
-      client.release();
-      return 0;
-    }
+      const nowEpoch = Math.floor(Date.now() / 1000);
+      let remainingBudget = MAX_QUEUE_DEPTH - (await getPendingQueueDepth());
+      if (remainingBudget < 0) remainingBudget = 0;
 
-    logger.info({ count: claimed.length }, "[scheduler] claimed due jobs");
+      // Claiming, scheduling, AND the outbox write all happen in the SAME
+      // transaction now. That matters specifically for ONCE jobs:
+      // markJobScheduledBatch clears next_run as part of this transaction,
+      // so if the process crashes anywhere before COMMIT, the whole batch
+      // rolls back and every job goes right back to being a normal due job
+      // on the next poll - no window where it's claimed (locked_at set) but
+      // next_run is still sitting in the past.
+      //
+      // Because a single set-based INSERT can't skip just the one bad row
+      // the way a per-job savepoint could, validation happens BEFORE any
+      // write: computeJobSchedule is called for every claimed job up front
+      // (pure in-memory, no DB round-trip). Jobs are then processed in
+      // claim order (ORDER BY next_run - most overdue first, see
+      // claimDueJobs) against the remaining queue-depth budget: a job whose
+      // ticks don't fit in what's left has its claim released untouched -
+      // whole job, no partial catchup - and is deferred to the next poll,
+      // same as every job after it in the batch. Jobs that fail schedule
+      // computation entirely (e.g. malformed cron_expression) are excluded
+      // the same way.
+      const validJobs = [];
+      const invalidJobIds = [];
+      const budgetStarvedJobIds = [];
+      let budgetExhausted = false;
 
-    const nowEpoch = Math.floor(Date.now() / 1000);
-    let remainingBudget = MAX_QUEUE_DEPTH - (await getPendingQueueDepth());
-    if (remainingBudget < 0) remainingBudget = 0;
-
-    // Claiming, scheduling, AND the outbox write all happen in the SAME
-    // transaction now. That matters specifically for ONCE jobs:
-    // markJobScheduledBatch clears next_run as part of this transaction,
-    // so if the process crashes anywhere before COMMIT, the whole batch
-    // rolls back and every job goes right back to being a normal due job
-    // on the next poll - no window where it's claimed (locked_at set) but
-    // next_run is still sitting in the past.
-    //
-    // Because a single set-based INSERT can't skip just the one bad row
-    // the way a per-job savepoint could, validation happens BEFORE any
-    // write: computeJobSchedule is called for every claimed job up front
-    // (pure in-memory, no DB round-trip). Jobs are then processed in
-    // claim order (ORDER BY next_run - most overdue first, see
-    // claimDueJobs) against the remaining queue-depth budget: a job whose
-    // ticks don't fit in what's left has its claim released untouched -
-    // whole job, no partial catchup - and is deferred to the next poll,
-    // same as every job after it in the batch. Jobs that fail schedule
-    // computation entirely (e.g. malformed cron_expression) are excluded
-    // the same way.
-    const validJobs = [];
-    const invalidJobIds = [];
-    const budgetStarvedJobIds = [];
-    let budgetExhausted = false;
-
-    for (const job of claimed) {
-      if (budgetExhausted) {
-        budgetStarvedJobIds.push(job.job_id);
-        continue;
-      }
-
-      let schedule;
-      try {
-        schedule = computeJobSchedule(job, nowEpoch);
-      } catch (err) {
-        invalidJobIds.push(job.job_id);
-        logger.error(
-          { err, jobId: job.job_id },
-          "[scheduler] failed to compute next run, releasing claim"
-        );
-        continue;
-      }
-
-      if (schedule.ticks.length > remainingBudget) {
-        budgetStarvedJobIds.push(job.job_id);
-        budgetExhausted = true;
-        continue;
-      }
-
-      remainingBudget -= schedule.ticks.length;
-      validJobs.push({ job, ...schedule });
-    }
-
-    if (invalidJobIds.length > 0) {
-      await releaseJobClaims(client, invalidJobIds, "invalid_schedule");
-    }
-    if (budgetStarvedJobIds.length > 0) {
-      logger.warn(
-        { count: budgetStarvedJobIds.length, jobIds: budgetStarvedJobIds },
-        "[scheduler] releasing claims - execution queue depth budget exhausted for this poll"
-      );
-      await releaseJobClaims(client, budgetStarvedJobIds, "queue_depth_budget");
-    }
-
-    if (validJobs.length > 0) {
-      const attempt = 1;
-
-      const executionEntries = validJobs.flatMap(({ job, ticks }) =>
-        ticks.map((scheduledFor) => ({ jobId: job.job_id, attempt, scheduledFor }))
-      );
-      const executionRows = await createExecutionBatch(client, executionEntries);
-
-      // Match back on (job_id, scheduled_for), not job_id alone - a job
-      // can now own multiple rows in this batch (backfill), all with the
-      // same attempt=1, so job_id alone is no longer unique.
-      const executionIdByKey = new Map(
-        executionRows.map((r) => [`${r.job_id}:${r.scheduled_for}`, { executionId: r.execution_id, createdAt: r.created_at }])
-      );
-
-      await markJobScheduledBatch(
-        client,
-        validJobs.map(({ job, nextRunEpoch, isRecurring }) => ({
-          jobId: job.job_id,
-          nextRun: nextRunEpoch,
-          isRecurring,
-        }))
-      );
-
-      const outboxEntries = [];
-      for (const { job, ticks } of validJobs) {
-        for (const scheduledFor of ticks) {
-          const { executionId, createdAt } = executionIdByKey.get(`${job.job_id}:${scheduledFor}`);
-          outboxEntries.push({
-            executionId,
-            executionCreatedAt: createdAt,
-            queueKey: EXECUTION_QUEUE_KEY,
-            payload: { ...job, execution_id: executionId, created_at: createdAt, attempt, scheduled_for: scheduledFor },
-          });
-          toEnqueue.push({ ...job, execution_id: executionId, created_at: createdAt, scheduled_for: scheduledFor });
+      for (const job of claimed) {
+        if (budgetExhausted) {
+          budgetStarvedJobIds.push(job.job_id);
+          continue;
         }
+
+        let schedule;
+        try {
+          schedule = computeJobSchedule(job, nowEpoch);
+        } catch (err) {
+          invalidJobIds.push(job.job_id);
+          logger.error(
+            { err, jobId: job.job_id },
+            "[scheduler] failed to compute next run, releasing claim"
+          );
+          continue;
+        }
+
+        if (schedule.ticks.length > remainingBudget) {
+          budgetStarvedJobIds.push(job.job_id);
+          budgetExhausted = true;
+          continue;
+        }
+
+        remainingBudget -= schedule.ticks.length;
+        validJobs.push({ job, ...schedule });
       }
-      await createOutboxEntryBatch(client, outboxEntries);
-    }
 
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    logger.error({ err }, "[scheduler] failed to claim/schedule due jobs, batch rolled back");
-    client.release();
-    return 0;
-  }
+      if (invalidJobIds.length > 0) {
+        await releaseJobClaims(client, invalidJobIds, "invalid_schedule");
+      }
+      if (budgetStarvedJobIds.length > 0) {
+        logger.warn(
+          { count: budgetStarvedJobIds.length, jobIds: budgetStarvedJobIds },
+          "[scheduler] releasing claims - execution queue depth budget exhausted for this poll"
+        );
+        await releaseJobClaims(client, budgetStarvedJobIds, "queue_depth_budget");
+      }
 
-  client.release();
+      const toEnqueue = [];
 
-  // The transaction already committed, so every job in toEnqueue is
-  // durably scheduled in Postgres AND has a matching execution_outbox
-  // row with published_at still NULL. This loop is just the fast path:
-  // publish to Redis immediately so executions don't sit around waiting
-  // for the relay's next tick. If this fails, or the process crashes
-  // right here, nothing is lost - the outbox row is still there, and
-  // the outbox relay (src/outbox) will publish it on its next sweep.
-  for (const job of toEnqueue) {
-    try {
-      const published = await publishOutboxEntryNow({
-        executionId: job.execution_id,
-        queueKey: EXECUTION_QUEUE_KEY,
-        payload: job,
-      });
-      logger.info(
-        { jobId: job.job_id, executionId: job.execution_id, published },
-        published ? "[scheduler] execution queued" : "[scheduler] execution queued, deferred to outbox relay"
-      );
-    } catch (err) {
-      logger.error(
-        { err, jobId: job.job_id, executionId: job.execution_id },
-        "[scheduler] fast-path publish failed, execution left for outbox relay"
-      );
-    }
-  }
+      if (validJobs.length > 0) {
+        const attempt = 1;
 
-  return claimed.length;
+        const executionEntries = validJobs.flatMap(({ job, ticks }) =>
+          ticks.map((scheduledFor) => ({ jobId: job.job_id, attempt, scheduledFor }))
+        );
+        const executionRows = await createExecutionBatch(client, executionEntries);
+
+        // Match back on (job_id, scheduled_for), not job_id alone - a job
+        // can now own multiple rows in this batch (backfill), all with the
+        // same attempt=1, so job_id alone is no longer unique.
+        const executionIdByKey = new Map(
+          executionRows.map((r) => [`${r.job_id}:${r.scheduled_for}`, { executionId: r.execution_id, createdAt: r.created_at }])
+        );
+
+        await markJobScheduledBatch(
+          client,
+          validJobs.map(({ job, nextRunEpoch, isRecurring }) => ({
+            jobId: job.job_id,
+            nextRun: nextRunEpoch,
+            isRecurring,
+          }))
+        );
+
+        const outboxEntries = [];
+        for (const { job, ticks } of validJobs) {
+          for (const scheduledFor of ticks) {
+            const { executionId, createdAt } = executionIdByKey.get(`${job.job_id}:${scheduledFor}`);
+            outboxEntries.push({
+              executionId,
+              executionCreatedAt: createdAt,
+              queueKey: EXECUTION_QUEUE_KEY,
+              payload: { ...job, execution_id: executionId, created_at: createdAt, attempt, scheduled_for: scheduledFor },
+            });
+            toEnqueue.push({ ...job, execution_id: executionId, created_at: createdAt, scheduled_for: scheduledFor });
+          }
+        }
+        await createOutboxEntryBatch(client, outboxEntries);
+      }
+
+      return { claimedCount: claimed.length, toEnqueue };
+    },
+    { claimedCount: 0, toEnqueue: [] }
+  );
+
+  await publishClaimedBatch(
+    "scheduler",
+    toEnqueue,
+    (job) => ({
+      executionId: job.execution_id,
+      queueKey: EXECUTION_QUEUE_KEY,
+      payload: job,
+    }),
+    (job) => ({ jobId: job.job_id, executionId: job.execution_id }),
+    { itemLabel: "execution", verb: "queued" }
+  );
+
+  return claimedCount;
 }
 
 export { EXECUTION_QUEUE_KEY };
