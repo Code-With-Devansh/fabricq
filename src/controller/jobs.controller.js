@@ -13,7 +13,7 @@ import {
 import {
   updateJobSchema,
   listJobsQuerySchema,
-  paginationQuerySchema,
+  executionHistoryQuerySchema,
 } from "../validators/http_job.js";
 
 // Jobs are reachable two ways - the dashboard (/teams/:teamId/jobs, JWT +
@@ -42,19 +42,22 @@ export const getJobs = asyncHandler(async (req, res) => {
     throw new AppError("Invalid query parameters", 400, validated.error.flatten());
   }
 
-  const { status, enabled, schedule_type, limit, offset } = validated.data;
+  const { status, enabled, schedule_type, limit, offset, sort_by, sort_dir } =
+    validated.data;
   const { jobs, total } = await getJobsService(resolveTeamId(req), {
     status,
     enabled,
     schedule_type,
     limit,
     offset,
+    sort_by,
+    sort_dir,
   });
 
   return res.status(200).json({
     success: true,
     data: jobs,
-    pagination: { total, limit, offset },
+    pagination: { total, limit, offset, sort_by, sort_dir },
   });
 });
 
@@ -83,22 +86,22 @@ export const deleteJob = asyncHandler(async (req, res) => {
 });
 
 export const getJobExecutions = asyncHandler(async (req, res) => {
-  const validated = paginationQuerySchema.safeParse(req.query);
+  const validated = executionHistoryQuerySchema.safeParse(req.query);
   if (!validated.success) {
     throw new AppError("Invalid query parameters", 400, validated.error.flatten());
   }
 
-  const { limit, offset } = validated.data;
-  const { executions, total } = await getJobExecutionHistoryService(
+  const { limit, cursor, status, sort } = validated.data;
+  const { executions, nextCursor } = await getJobExecutionHistoryService(
     resolveTeamId(req),
     req.params.jobId,
-    { limit, offset }
+    { limit, cursor, status, sort }
   );
 
   return res.status(200).json({
     success: true,
     data: executions,
-    pagination: { total, limit, offset },
+    pagination: { limit, sort, next_cursor: nextCursor },
   });
 });
 

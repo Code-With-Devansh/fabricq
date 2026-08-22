@@ -30,7 +30,7 @@ export const createJobService = async (teamId, data) => {
 
 export const getJobsService = async (
   teamId,
-  { status, enabled, schedule_type, limit, offset }
+  { status, enabled, schedule_type, limit, offset, sort_by, sort_dir }
 ) => {
   return listJobsForTeam({
     teamId,
@@ -39,6 +39,8 @@ export const getJobsService = async (
     scheduleType: schedule_type,
     limit,
     offset,
+    sortBy: sort_by,
+    sortDir: sort_dir,
   });
 };
 
@@ -100,11 +102,11 @@ export const deleteJobService = async (teamId, jobId) => {
 export const getJobExecutionHistoryService = async (
   teamId,
   jobId,
-  { limit, offset }
+  { limit, cursor, status, sort }
 ) => {
   const job = await findJobByIdForTeam(teamId, jobId);
   if (!job) throw new AppError("Job not found", 404);
-  return getExecutionHistory(jobId, { limit, offset });
+  return getExecutionHistory(jobId, { limit, cursor, status, sort });
 };
 
 export const getExecutionDetailService = async (teamId, executionId) => {

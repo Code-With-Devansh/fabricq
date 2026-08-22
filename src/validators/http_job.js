@@ -275,9 +275,30 @@ export const listJobsQuerySchema = z.object({
   schedule_type: z.enum(["ONCE", "CRON"]).optional(),
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
   offset: z.coerce.number().int().min(0).optional().default(0),
+  // Stays offset-based (unlike execution history): jobs-per-team is
+  // bounded, and the dashboard wants total/page-N, which keyset
+  // pagination doesn't give for free.
+  sort_by: z.enum(["created_at", "updated_at", "next_run"]).optional().default("created_at"),
+  sort_dir: z.enum(["asc", "desc"]).optional().default("desc"),
 });
 
-export const paginationQuerySchema = z.object({
+// Execution history is keyset (cursor) paginated, not offset - see
+// execution.repository.js#getExecutionHistory for why. `cursor` is the
+// opaque token from the previous page's `nextCursor`; omit it to start
+// from the first page.
+export const executionHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
-  offset: z.coerce.number().int().min(0).optional().default(0),
+  cursor: z.string().optional(),
+  status: z
+    .enum([
+      "queued",
+      "running",
+      "success",
+      "failed",
+      "retry_wait",
+      "failed_permanent",
+      "failed_max_retries",
+    ])
+    .optional(),
+  sort: z.enum(["asc", "desc"]).optional().default("desc"),
 });

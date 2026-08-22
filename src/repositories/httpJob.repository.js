@@ -1,4 +1,5 @@
 import { pool } from "../config/db.js";
+import { AppError } from "../Error/appError.js";
 
 export async function createJob(job) {
   const query = `
@@ -249,6 +250,11 @@ export async function findJobByIdForTeam(teamId, jobId) {
 
 const OUTCOME_STATUSES = new Set(["COMPLETED", "FAILED"]);
 
+// Whitelist of sortable columns - sortBy is interpolated directly into the
+// ORDER BY clause (Postgres doesn't allow column names as bind params), so
+// this must stay a closed set validated against, never passed through raw.
+const SORTABLE_COLUMNS = new Set(["created_at", "updated_at", "next_run"]);
+
 export async function listJobsForTeam({
   teamId,
   status,
@@ -256,7 +262,13 @@ export async function listJobsForTeam({
   scheduleType,
   limit,
   offset,
+  sortBy = "created_at",
+  sortDir = "desc",
 }) {
+  if (!SORTABLE_COLUMNS.has(sortBy)) {
+    throw new AppError(`Invalid sort column: ${sortBy}`, 400);
+  }
+  const direction = sortDir === "asc" ? "ASC" : "DESC";
   const conditions = ["team_id = $1"];
   const values = [teamId];
 
@@ -294,9 +306,12 @@ export async function listJobsForTeam({
   values.push(offset);
   const offsetIdx = values.length;
 
+  // Tie-break on job_id so rows with an identical sortBy value (e.g. many
+  // jobs sharing a next_run tick) still come back in a stable order across
+  // pages instead of shuffling between requests.
   const { rows } = await pool.query(
     `SELECT * FROM http_jobs ${where}
-     ORDER BY created_at DESC
+     ORDER BY ${sortBy} ${direction}, job_id ${direction}
      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
     values
   );

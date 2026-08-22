@@ -1,4 +1,6 @@
 import { pool } from "../config/db.js";
+import { encodeCursor, decodeCursor } from "../utils/cursor.js";
+import { AppError } from "../Error/appError.js";
 
 export async function createExecution(client, { jobId, attempt, scheduledFor }) {
   const { rows } = await client.query(
@@ -270,14 +272,56 @@ export async function getExecutionByIdForTeam(teamId, executionId) {
   return rows[0] ?? null;
 }
 
-export async function getExecutionHistory(jobId, { limit = 50, offset = 0 } = {}) {
+// Keyset (cursor) pagination, not offset. job_executions is partitioned by
+// created_at and PK'd on (execution_id, created_at) - there's no cheap way
+// to skip N rows with OFFSET across partitions as history grows, so we
+// resume from the last row's (created_at, execution_id) instead. That pair
+// is also what idx_job_executions_job_created (job_id, created_at DESC)
+// serves directly, with execution_id only needed to break ties on rows
+// sharing the same created_at.
+//
+// sort controls direction; the comparison operator flips with it so a
+// cursor is always interpreted relative to the same ordering the caller
+// is currently paging in.
+export async function getExecutionHistory(
+  jobId,
+  { limit = 50, cursor, status, sort = "desc" } = {}
+) {
+  const conditions = ["job_id = $1"];
+  const values = [jobId];
+
+  if (status) {
+    values.push(status);
+    conditions.push(`status = $${values.length}`);
+  }
+
+  const desc = sort !== "asc";
+  const op = desc ? "<" : ">";
+
+  if (cursor) {
+    let created_at, execution_id;
+    try {
+      ({ created_at, execution_id } = decodeCursor(cursor));
+    } catch {
+      throw new AppError("Invalid cursor", 400);
+    }
+    values.push(created_at, execution_id);
+    conditions.push(
+      `(created_at, execution_id) ${op} ($${values.length - 1}, $${values.length})`
+    );
+  }
+
+  values.push(limit);
+
   const { rows } = await pool.query(
-    `SELECT * FROM job_executions WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-    [jobId, limit, offset]
+    `SELECT * FROM job_executions
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY created_at ${desc ? "DESC" : "ASC"}, execution_id ${desc ? "DESC" : "ASC"}
+     LIMIT $${values.length}`,
+    values
   );
-  const { rows: countRows } = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM job_executions WHERE job_id = $1`,
-    [jobId]
-  );
-  return { executions: rows, total: countRows[0].count };
+
+  const nextCursor = rows.length === limit ? encodeCursor(rows[rows.length - 1]) : null;
+
+  return { executions: rows, nextCursor };
 }
