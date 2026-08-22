@@ -375,15 +375,20 @@ async function handleExecution(job) {
   // that already advanced independently at claim time (scheduler.js) and
   // is never touched here, for ONCE or CRON alike. The only http_jobs
   // write left is disabling a ONCE job once it's fully resolved.
-  const client = await pool.connect();
+  //
+  // No explicit transaction: every branch below performs at most one
+  // write (disableJob XOR scheduleExecutionRetry, never both), and a
+  // single statement is already atomic in Postgres. Using pool.query
+  // directly instead of checking out a client avoids holding a pooled
+  // connection for the duration of this branch. If a future change adds
+  // a second write to any one branch, wrap that branch in an explicit
+  // client + BEGIN/COMMIT again - don't let two writes land non-atomically.
   let willRetry = false;
   // Final status for this execution row, set below in every branch except
   // the "will retry" one (scheduleExecutionRetry owns the row's status -
   // retry_wait - in that case, see migration 020).
   let finalStatus = null;
   try {
-    await client.query("BEGIN");
-
     const isRecurring = job.schedule_type === "CRON";
     const attempt = job.attempt; // this execution's current attempt number
     const exhausted = attempt >= job.max_attempts;
@@ -391,7 +396,7 @@ async function handleExecution(job) {
     if (result.success) {
       finalStatus = "success";
       if (!isRecurring) {
-        await disableJob(client, job.job_id);
+        await disableJob(pool, job.job_id);
       }
     } else {
       // Cause (why it failed) and retryability (whether to try again) are
@@ -404,13 +409,13 @@ async function handleExecution(job) {
       if (classification === "permanent") {
         finalStatus = "failed_permanent";
         if (!isRecurring) {
-          await disableJob(client, job.job_id);
+          await disableJob(pool, job.job_id);
         }
       } else if (!exhausted) {
         // Retries now work the same way for ONCE and CRON: a single
         // triggered execution gets retried in place, independent of the
         // job's own schedule cursor. See migration 020 / scheduleRetry.js.
-        await scheduleExecutionRetry(client, {
+        await scheduleExecutionRetry(pool, {
           executionId: job.execution_id,
           createdAt: job.created_at ?? null,
           job,
@@ -421,24 +426,19 @@ async function handleExecution(job) {
       } else {
         finalStatus = "failed_max_retries";
         if (!isRecurring) {
-          await disableJob(client, job.job_id);
+          await disableJob(pool, job.job_id);
         }
       }
     }
     // CRON, not retrying (permanent or exhausted): nothing further to do
     // to http_jobs - the next tick is already scheduled regardless of
     // this execution's outcome.
-
-    await client.query("COMMIT");
   } catch (err) {
-    await client.query("ROLLBACK");
     logger.error(
       { err, executionId: job.execution_id },
       "[worker] failed to update job after execution",
     );
     throw err;
-  } finally {
-    client.release();
   }
 
   // Execution-detail row (response body, status, redirects) is write-behind:
