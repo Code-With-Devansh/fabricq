@@ -9,19 +9,6 @@
 8. Retry sweep and scheduler poll are structurally identical but not unified. runRetrySweep and pollAndScheduleDueJobs both do claim → outbox write → fast-publish-then-relay in the same shape, duplicated across two files. Not wrong, but a shared claimAndPublish(claimFn, buildPayloadFn) helper would remove ~40 lines of duplicated transaction/publish boilerplate and reduce the surface where the two could drift apart (e.g. one gets a bugfix the other doesn't).
 
 0.1 all the query's that fetch some data uses limit and offset based pagination.
-0.2 If your worker currently does:
-
-BEGIN
-UPDATE http_jobs ...
-COMMIT
-
-for only this scheduling update, you don't need an explicit transaction. worker.js line 303 const client = await pool.connect();
-
-
-0.4: retry configuration per-job? not configurable for deployment configureable on self deployment.
-
-0.6 429 special-casing — do you want to honor Retry-After headers when present, overriding your configured backoff strategy for that one attempt? That's a nice-to-have but changes scheduleExecutionRetry's inputs.
-let this configurable if to honor retry after or not.
 
 0.6 listJobsForTeam runs the full WHERE twice (data query + separate COUNT(*)) — for large teams this doubles scan cost. Consider COUNT(*) OVER() as a window function in the single query instead of two round trips, or cap/estimate counts for large result sets.
 
@@ -30,13 +17,6 @@ let this configurable if to honor retry after or not.
 2.improved some security, further can be improved.  ref: https://pixel-mart.in/1s07T
 
 3. add raw body type ref: https://pixel-mart.in/1s07O
-
-5. Your current constraint:
-CONSTRAINT system_role_has_no_team
-    CHECK (NOT is_system OR team_id IS NULL)
-allows this invalid row:
-is_system = false
-team_id   = NULL
 
 11. auth_config (bearer tokens, basic-auth passwords, API keys) is stored as plaintext JSONB. If this DB is ever read by an analyst, backup, or breached, all downstream credentials leak. Consider app-level encryption (e.g., encrypt auth_config with a KMS-managed key before insert).ref: https://pixel-mart.in/1s07P
 
