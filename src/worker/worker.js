@@ -11,6 +11,7 @@ import {
   disableJob,
 } from "../repositories/httpJob.repository.js";
 import { scheduleExecutionRetry } from "../retry/scheduleRetry.js";
+import { parseRetryAfter } from "../retry/backoff.js";
 import { classifyFailure } from "../retry/classifyFailure.js";
 import config from "../config/index.js";
 import {
@@ -207,6 +208,10 @@ async function executeHttpJob(execution) {
           redirectCount: redirects.length,
           redirects,
           error: res.ok ? null : `HTTP ${res.status}`,
+          // Parsed eagerly regardless of job.honor_retry_after - cheap, and
+          // keeps the "should we honor it" decision entirely in
+          // scheduleRetry.js/backoff.js rather than duplicated here.
+          retryAfterSeconds: res.ok ? null : parseRetryAfter(res.headers.get("retry-after")),
         };
       }
       if (redirectMode === "error") {
@@ -410,6 +415,7 @@ async function handleExecution(job) {
           createdAt: job.created_at ?? null,
           job,
           attempt,
+          retryAfterSeconds: result.retryAfterSeconds ?? null,
         });
         willRetry = true;
       } else {

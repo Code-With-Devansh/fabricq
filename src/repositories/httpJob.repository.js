@@ -24,6 +24,7 @@ export async function createJob(job) {
       retry_strategy,
       retry_multiplier,
       retry_max_seconds,
+      honor_retry_after,
       redirect_policy,
       backfill_on_missed_run,
       max_catchup_per_poll
@@ -50,9 +51,10 @@ export async function createJob(job) {
       $19,
       $20,
       $21,
-      $22::jsonb,
-      $23,
-      $24
+      $22,
+      $23::jsonb,
+      $24,
+      $25
  )
     RETURNING *;
   `;
@@ -78,7 +80,12 @@ export async function createJob(job) {
     job.timeout_ms ?? 30000,
     job.retry_strategy ?? "FIXED",
     job.retry_multiplier ?? 2,
-    job.retry_max_seconds ?? 3600,
+    // No ?? fallback here: the create schema already defaults this to 3600
+    // when omitted, so by this point it's either that default or an
+    // explicit null (uncapped) from the caller - coalescing would silently
+    // turn "explicitly uncapped" back into 3600.
+    job.retry_max_seconds,
+    job.honor_retry_after ?? false,
     JSON.stringify(
       job.redirect_policy ?? {
         maxRedirects: 10,
@@ -323,6 +330,7 @@ export async function updateJobForTeam(teamId, jobId, fields) {
     "retry_strategy",
     "retry_multiplier",
     "retry_max_seconds",
+    "honor_retry_after",
     "backfill_on_missed_run",
     "max_catchup_per_poll",
     // redirect_policy intentionally excluded from this list - it's jsonb

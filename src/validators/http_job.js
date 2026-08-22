@@ -78,7 +78,17 @@ export const createJobSchema = z
 
     retry_multiplier: z.number().positive().optional().default(2),
 
-    retry_max_seconds: z.number().int().min(0).optional().default(3600),
+    // Nullable = no ceiling (applies to every retry_strategy, and to
+    // Retry-After honoring below). Defaults to a bounded value; pass null
+    // explicitly to opt a job out of capping.
+    retry_max_seconds: z.number().int().min(0).nullable().optional().default(3600),
+
+    // When true, a retryable failure whose response carries a Retry-After
+    // header uses that header's delay for the next attempt instead of the
+    // configured retry_strategy - for that one attempt only. Falls back to
+    // retry_strategy if the header is absent, unparseable, or resolves to a
+    // non-positive delay. Still bounded by retry_max_seconds when set.
+    honor_retry_after: z.boolean().optional().default(false),
 
     // See migration 023. backfill_on_missed_run only makes sense for CRON
     // jobs - a ONCE job has exactly one due tick by definition, there's
@@ -187,7 +197,10 @@ export const updateJobSchema = z
       ])
       .optional(),
     retry_multiplier: z.number().positive().optional(),
-    retry_max_seconds: z.number().int().min(0).optional(),
+    // .nullable() lets a PATCH explicitly clear the cap (send null);
+    // omitting the field entirely still means "don't change it".
+    retry_max_seconds: z.number().int().min(0).nullable().optional(),
+    honor_retry_after: z.boolean().optional(),
     backfill_on_missed_run: z.boolean().optional(),
     max_catchup_per_poll: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),

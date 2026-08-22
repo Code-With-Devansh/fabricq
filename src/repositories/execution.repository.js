@@ -250,7 +250,7 @@ export async function claimDueRetries(client, limit = 100) {
                hj.body_type, hj.auth_type, hj.auth_config, hj.redirect_mode,
                hj.redirect_policy, hj.timeout_ms, hj.schedule_type,
                hj.max_attempts, hj.backoff_seconds, hj.retry_strategy,
-               hj.retry_multiplier, hj.retry_max_seconds, hj.enabled,
+               hj.retry_multiplier, hj.retry_max_seconds, hj.honor_retry_after, hj.enabled,
                hj.job_id AS hj_job_id`,
     [limit]
   );

@@ -31,6 +31,7 @@ function buildRetryPayload(row) {
     retry_strategy: row.retry_strategy,
     retry_multiplier: row.retry_multiplier,
     retry_max_seconds: row.retry_max_seconds,
+    honor_retry_after: row.honor_retry_after,
   };
 }
 
