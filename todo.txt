@@ -1,14 +1,7 @@
-2. fabricq:execution-results stream has no MAXLEN. The execution queue stream (fabricq:executions) trims via XADD ... MAXLEN ~, but the results stream that pushExecutionEvent writes to does not. If the merger ever falls behind, this stream grows unbounded — same class of bug as the one you already caught and fixed for the queue.
-
 3. Minor: package.json has "test": "echo ... && exit 1" — zero test coverage, no CI config, no lint/prettier config anywhere in the repo. For a system this architecturally sophisticated (partitioning, outbox, streams, SSRF), the complete absence of tests is the biggest gap between "impressive design" and "production-ready."
 
 4. Minor: no README — for a portfolio piece, that's actually costing you, since none of this careful design work is visible unless someone reads the code.
 
-7. fabricq:execution-results stream still has no MAXLEN (raised earlier) — this is the last unbounded-growth spot in the pipeline; everything else (outbox, execution queue, status hash-in-theory) accounts for it.
-
-8. Retry sweep and scheduler poll are structurally identical but not unified. runRetrySweep and pollAndScheduleDueJobs both do claim → outbox write → fast-publish-then-relay in the same shape, duplicated across two files. Not wrong, but a shared claimAndPublish(claimFn, buildPayloadFn) helper would remove ~40 lines of duplicated transaction/publish boilerplate and reduce the surface where the two could drift apart (e.g. one gets a bugfix the other doesn't).
-
-0.1 all the query's that fetch some data uses limit and offset based pagination.
 
 0.6 listJobsForTeam runs the full WHERE twice (data query + separate COUNT(*)) — for large teams this doubles scan cost. Consider COUNT(*) OVER() as a window function in the single query instead of two round trips, or cap/estimate counts for large result sets.
 
